@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"strings"
 	"net/http"
@@ -13,7 +15,35 @@ import (
 	"flag"
 )
 
-const configFileName = "config.txt"
+const (
+	configFileName = "config.txt"
+
+	// ── 探测 ──────────────────────────────────────────────
+	// 超时留足余量：实测校园网有线 p99=72ms，WiFi 出现过 619ms 的延迟尖峰，
+	// 原先 1s 的预算会把一次尖峰误判成断网。
+	probeURL      = "http://connect.rom.miui.com/generate_204"
+	probeTimeout  = 2 * time.Second
+	failThreshold = 2 // 连续失败达到该次数才判定断网（原先单次失败即判定）
+
+	// ── 探测节奏 ──────────────────────────────────────────
+	intervalOnline = 5 * time.Second // 稳定在线时的探测间隔
+	intervalFast   = 1 * time.Second // 出现失败后加快探测，便于尽快发现恢复
+
+	// ── 登录 ──────────────────────────────────────────────
+	loginTimeout   = 5 * time.Second // 原先 http.Get 无超时，是唯一会永久卡死的地方
+	loginCooldown  = 5 * time.Minute // 认证成功后：探测恢复之前不再重复登录
+	sessionRecheck = 1 * time.Minute // 服务器报告"已有会话"后：隔多久再尝试一次登录
+)
+
+// loginBackoff 登录失败后的重试退避序列（附加 ±20% 抖动）
+var loginBackoff = []time.Duration{
+	1 * time.Second,
+	2 * time.Second,
+	5 * time.Second,
+	10 * time.Second,
+	30 * time.Second,
+	60 * time.Second,
+}
 
 // Config 结构体保存配置
 type Config struct {
@@ -128,6 +158,38 @@ func getLocalIP() (string, error) {
 	return conn.LocalAddr().(*net.UDPAddr).IP.String(), nil
 }
 
+func getMACForIP(ip string) (string, error) {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return "", err
+	}
+
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+
+		mac := iface.HardwareAddr.String()
+		if mac == "" {
+			continue
+		}
+
+		addrs, _ := iface.Addrs()
+		for _, addr := range addrs {
+			ipnet, ok := addr.(*net.IPNet)
+			if !ok || ipnet.IP.IsLoopback() || ipnet.IP.To4() == nil {
+				continue
+			}
+			if ipnet.IP.String() == ip {
+				return mac, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("未找到持有 IP %s 的网卡", ip)
+}
+
+// getMACAddress 取第一块可用网卡的 MAC，作为 getMACForIP 匹配失败时的兜底。
+// 注意：多网卡 / 虚拟机环境下它可能取到与认证 IP 无关的网卡。
 func getMACAddress() (string, error) {
 	interfaces, err := net.Interfaces()
 	if err != nil {
@@ -156,9 +218,9 @@ func getMACAddress() (string, error) {
 
 func isNetworkOK() bool {
 	client := &http.Client{
-		Timeout: 1 * time.Second,
+		Timeout: probeTimeout,
 	}
-	resp, err := client.Get("http://connect.rom.miui.com/generate_204")
+	resp, err := client.Get(probeURL)
 	if err != nil {
 		return false // 网络不通 / DNS 故障 / 超时
 	}
@@ -167,7 +229,50 @@ func isNetworkOK() bool {
 	return resp.StatusCode == 204
 }
 
-func login(cfg *Config, ip, mac string) {
+// loginOutcome 描述一次登录尝试的结果
+type loginOutcome struct {
+	status    int    // HTTP 状态码，0 表示请求未能发出
+	success   bool   // result == 1
+	alreadyUp bool   // msg == "512"：该 IP 已有会话
+	msg       string // 服务器返回的 msg；响应无法解析时为原始响应体片段
+	err       error
+}
+
+func (o loginOutcome) desc() string {
+	switch {
+	case o.err != nil:
+		return fmt.Sprintf("登录请求失败: %v", o.err)
+	case o.success:
+		return fmt.Sprintf("认证成功（msg=%s）", o.msg)
+	case o.alreadyUp:
+		return fmt.Sprintf("服务器报告该 IP 已有会话（msg=%s）", o.msg)
+	default:
+		return fmt.Sprintf("认证未成功（HTTP %d, msg=%s）", o.status, o.msg)
+	}
+}
+
+type loginResp struct {
+	Result  int             `json:"result"`
+	Msg     string          `json:"msg"`
+	RetCode json.RawMessage `json:"ret_code"` // 可能是数字也可能是字符串，按原样保留
+}
+
+// parseLoginResponse 解析形如 dr1003({"result":1,"msg":"…"}); 的 JSONP 响应
+func parseLoginResponse(body string) (result int, msg string, ok bool) {
+	start := strings.Index(body, "{")
+	end := strings.LastIndex(body, "}")
+	if start < 0 || end <= start {
+		return 0, "", false
+	}
+
+	var r loginResp
+	if err := json.Unmarshal([]byte(body[start:end+1]), &r); err != nil {
+		return 0, "", false
+	}
+	return r.Result, r.Msg, true
+}
+
+func login(cfg *Config, ip, mac string) loginOutcome {
 	// 格式化 MAC：去掉冒号，转小写（适配你 bash 脚本的行为）
 	cleanMAC := strings.ReplaceAll(strings.ToLower(mac), ":", "")
 
@@ -194,23 +299,49 @@ func login(cfg *Config, ip, mac string) {
 
 	loginURL := "http://172.17.0.2:801/eportal/portal/login?" + params.Encode()
 
-	resp, err := http.Get(loginURL)
+	client := &http.Client{Timeout: loginTimeout}
+	resp, err := client.Get(loginURL)
 	if err != nil {
-		fmt.Printf("❌ 登录请求失败: %v\n", err)
-		return
+		return loginOutcome{err: err}
 	}
 	defer resp.Body.Close()
 
-	// 读取并打印响应体
-	body, err := io.ReadAll(resp.Body)
+	// 限长读取：门户异常时可能返回大页面
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if err != nil {
-		fmt.Printf("❌ 读取响应体失败: %v\n", err)
-		return
+		return loginOutcome{status: resp.StatusCode, err: fmt.Errorf("读取响应体失败: %w", err)}
 	}
-	bodyStr := string(body)
+	bodyStr := strings.TrimSpace(string(body))
 
-	fmt.Printf("✅ 已发送登录请求（HTTP状态码: %d）\n", resp.StatusCode)
-	fmt.Printf("响应内容: %s\n", bodyStr)
+	result, msg, ok := parseLoginResponse(bodyStr)
+	if !ok {
+		// 例如门户返回 HTML 登录页：保留片段便于排障，按未成功处理
+		if r := []rune(bodyStr); len(r) > 120 {
+			bodyStr = string(r[:120]) + "…"
+		}
+		return loginOutcome{status: resp.StatusCode, msg: bodyStr}
+	}
+
+	return loginOutcome{
+		status:    resp.StatusCode,
+		success:   result == 1,
+		alreadyUp: msg == "512",
+		msg:       msg,
+	}
+}
+
+// nextBackoffIdx 返回退避序列的下一档下标（-1 表示尚未退避过）
+func nextBackoffIdx(cur int) int {
+	if cur+1 >= len(loginBackoff) {
+		return len(loginBackoff) - 1
+	}
+	return cur + 1
+}
+
+// jitter 给退避时长加 ±20% 抖动，避免多台设备同时重试
+func jitter(d time.Duration) time.Duration {
+	delta := float64(d) * 0.2
+	return d + time.Duration((rand.Float64()*2-1)*delta)
 }
 
 func getLoginInfo(cfg *Config) (ip, mac string, err error) {
@@ -226,9 +357,13 @@ func getLoginInfo(cfg *Config) (ip, mac string, err error) {
 	if err != nil {
 		return "", "", fmt.Errorf("获取本机IP失败: %w", err)
 	}
-	mac, err = getMACAddress()
+	mac, err = getMACForIP(ip)
 	if err != nil {
-		return "", "", fmt.Errorf("获取本机MAC失败: %w", err)
+		fmt.Printf("⚠️ %v，回退为自动选择网卡\n", err)
+		mac, err = getMACAddress()
+		if err != nil {
+			return "", "", fmt.Errorf("获取本机MAC失败: %w", err)
+		}
 	}
 	return ip, mac, nil
 }
@@ -294,7 +429,7 @@ func main() {
 		}
 		fmt.Printf("✅ 配置加载成功！\n")
 		fmt.Printf("用户: %s\n", cfg.User)
-		fmt.Printf("密码: %s\n", cfg.Password)
+		fmt.Printf("密码: ******（%d 字符）\n", len([]rune(cfg.Password)))
 		fmt.Printf("运营商: %s\n", cfg.NetType)
 		if cfg.RouterIP != "" && cfg.RouterMAC != "" {
 			fmt.Printf("路由器模式: IP=%s, MAC=%s\n", cfg.RouterIP, cfg.RouterMAC)
@@ -338,7 +473,7 @@ func main() {
 		// 显示配置
 		fmt.Printf("✅ 命令行参数加载成功！\n")
 		fmt.Printf("用户: %s\n", cfg.User)
-		fmt.Printf("密码: %s\n", cfg.Password)
+		fmt.Printf("密码: ******（%d 字符）\n", len([]rune(cfg.Password)))
 		fmt.Printf("运营商: %s\n", cfg.NetType)
 		if cfg.RouterIP != "" && cfg.RouterMAC != "" {
 			fmt.Printf("路由器模式: IP=%s, MAC=%s\n", cfg.RouterIP, cfg.RouterMAC)
@@ -368,18 +503,66 @@ func main() {
 	}
 
 	fmt.Printf("✅ 守护进程启动：认证IP=%s | 认证MAC=%s\n", ipAddr, macAddr)
+	fmt.Printf("   探测 %s\n", probeURL)
+	fmt.Printf("   超时 %s｜在线间隔 %s｜失败后 %s｜连续 %d 次失败判定断网\n",
+		probeTimeout, intervalOnline, intervalFast, failThreshold)
 
-	// 主循环
+	// 主循环：连续失败才判定断网；探测间隔自适应；登录失败按退避重试
+	loginCfg := &Config{User: user, Password: passwd, NetType: nettype}
+	fails, fast, backoffIdx := 0, false, -1
+	downLogged := false
+	sessionAssumed := false // 服务器确认过会话（成功或 512）后为 true：此时探测失败不再加速探测
+	var nextLogin, downSince time.Time
+
 	for {
-		if !isNetworkOK() {
-			fmt.Println("⚠️ 检测到断网，正在重新登录...")
-			login(&Config{
-				User:     user,
-				Password: passwd,
-				NetType:  nettype,
-			}, ipAddr, macAddr)
+		if isNetworkOK() {
+			if downLogged { // 仅在状态切换时打印，避免刷屏
+				fmt.Printf("✅ 网络已恢复（断网持续 %s）\n", time.Since(downSince).Round(time.Second))
+			}
+			fails, fast, backoffIdx, downLogged = 0, false, -1, false
+			sessionAssumed = false
+			nextLogin, downSince = time.Time{}, time.Time{}
+		} else {
+			fails++
+			// 会话已确认时探测失败更可能来自探测端点本身，保持在线档间隔，避免高频空探
+			if !sessionAssumed {
+				fast = true
+			}
+			// 只有"连续失败达到阈值"且"到了本次允许尝试的时间点"才重连：
+			// 前者挡掉单次抖动，后者挡掉冷却期内的重复请求。
+			if fails >= failThreshold && time.Now().After(nextLogin) {
+				if !downLogged {
+					downLogged = true
+					downSince = time.Now()
+					fmt.Printf("⚠️ 连续 %d 次探测失败，判定断网，开始重连\n", fails)
+				}
+				o := login(loginCfg, ipAddr, macAddr)
+				switch {
+				case o.success:
+					// 认证成功：进入冷却期，避免探测端点异常时反复登录
+					fmt.Printf("✅ %s\n", o.desc())
+					fails, backoffIdx = 0, -1
+					downLogged, downSince = false, time.Time{}
+					sessionAssumed, fast = true, false
+					nextLogin = time.Now().Add(loginCooldown)
+				case o.alreadyUp:
+					// 该 IP 已有会话：探测失败更可能来自探测端点本身，放慢节奏
+					fmt.Printf("ℹ️ %s，%s 后才会再次尝试登录，期间继续探测\n", o.desc(), sessionRecheck)
+					sessionAssumed, fast = true, false
+					nextLogin = time.Now().Add(sessionRecheck)
+				default:
+					backoffIdx = nextBackoffIdx(backoffIdx)
+					d := jitter(loginBackoff[backoffIdx])
+					nextLogin = time.Now().Add(d)
+					fmt.Printf("⚠️ %s，%s 后重试\n", o.desc(), d.Round(time.Second))
+				}
+			}
 		}
 
-		time.Sleep(1 * time.Second)
+		interval := intervalOnline
+		if fast {
+			interval = intervalFast
+		}
+		time.Sleep(interval)
 	}
 }
