@@ -17,10 +17,9 @@ const configFileName = "config.txt"
 
 // Config 结构体保存配置
 type Config struct {
-	User        string
-	Password    string
-	NetType     string // 新增字段
-	StudentMode bool
+	User     string
+	Password string
+	NetType  string // 新增字段
 
 	// 路由器模式（当两者都非空时启用）
 	RouterIP  string
@@ -39,8 +38,6 @@ User=
 Password=
 # 运营商选择，留空选择校园网，如果需要选择运营商，电信填写telecom，联通填写unicom，移动填写cmcc
 Net_Type=
-# 是否开启学生上网时段模式？1为开启，0为关闭，开启后周一到周五0:00-6:00将不会尝试重连
-Student_Mode=0
 # 开启路由器登陆模式：
 # 如果填写以下两个参数（均非空），则使用指定的路由器IP和MAC进行认证。
 # 否则使用本机IP和MAC。
@@ -90,8 +87,6 @@ Router_MAC=
 				cfg.Password = value
 			case "Net_Type":
 				cfg.NetType = value // 新增这一行
-			case "Student_Mode":
-				cfg.StudentMode = (value == "1")
 			case "Router_IP":
 				cfg.RouterIP = value
 			case "Router_MAC":
@@ -218,24 +213,6 @@ func login(cfg *Config, ip, mac string) {
 	fmt.Printf("响应内容: %s\n", bodyStr)
 }
 
-func shouldSkipLogin(cfg *Config) bool {
-	if !cfg.StudentMode {
-		return false
-	}
-
-	now := time.Now()
-	weekday := now.Weekday() // Sunday = 0, Monday = 1, ..., Friday = 5
-	hour := now.Hour()
-
-	// 周一到周五（1~5），且 0:00 ~ 5:59
-	if weekday >= time.Monday && weekday <= time.Friday && hour >= 0 && hour < 6 {
-		fmt.Println("🌙 学生模式：当前为禁网时段，暂停重连")
-		return true
-	}
-
-	return false
-}
-
 func getLoginInfo(cfg *Config) (ip, mac string, err error) {
 	// 如果启用了路由器模式（两个字段都非空）
 	if cfg.RouterIP != "" && cfg.RouterMAC != "" {
@@ -264,19 +241,18 @@ func printHelp() {
 
 可选参数：
 -nettype   运营商类型（telecom, unicom, cmcc），不加参数则使用校园网
--studentmode  启用学生模式（不带值）
 -ip        路由器IP（必须与-mac一起使用）
 -mac       路由器MAC（必须与-ip一起使用）
 -help      显示此帮助信息
 
 示例（Linux）：
 ./GXU_Net_AutoLogin -user 1807210721 -passwd mypassword
-/opt/GXU_Net_AutoLogin/GXU_Net_AutoLogin -user 1807210721 -passwd mypassword -nettype telecom -studentmode
+/opt/GXU_Net_AutoLogin/GXU_Net_AutoLogin -user 1807210721 -passwd mypassword -nettype telecom
 ./GXU_Net_AutoLogin -user 1807210721 -passwd mypassword -ip 172.16.6.6 -mac 36:88:8A:99:A4:CC
 
 示例（Windows）：
 GXU_Net_AutoLogin.exe -user 1807210721 -passwd mypassword
-C:\\Program Files\\GXU_Net_AutoLogin\\GXU_Net_AutoLogin.exe -user 1807210721 -passwd mypassword -nettype telecom -studentmode
+C:\\Program Files\\GXU_Net_AutoLogin\\GXU_Net_AutoLogin.exe -user 1807210721 -passwd mypassword -nettype telecom
 C:\\Program Files\\GXU_Net_AutoLogin\\GXU_Net_AutoLogin.exe -user 1807210721 -passwd mypassword -ip 172.16.6.6 -mac 36:88:8A:99:A4:CC
 `)
 }
@@ -285,19 +261,17 @@ func main() {
 	fmt.Printf("🚀广西大学校园网自动登陆程序 By：GTX690战术核显卡导弹（www.nekopara.uk）\n")
 	// 定义命令行参数
 	var (
-		user        string
-		passwd      string
-		nettype     string
-		studentMode bool
-		ip          string
-		mac         string
-		help        bool
+		user    string
+		passwd  string
+		nettype string
+		ip      string
+		mac     string
+		help    bool
 	)
 
 	flag.StringVar(&user, "user", "", "用户名")
 	flag.StringVar(&passwd, "passwd", "", "密码")
 	flag.StringVar(&nettype, "nettype", "", "运营商类型（telecom, unicom, cmcc）")
-	flag.BoolVar(&studentMode, "studentmode", false, "启用学生模式")
 	flag.StringVar(&ip, "ip", "", "路由器IP（必须与-mac一起使用）")
 	flag.StringVar(&mac, "mac", "", "路由器MAC（必须与-ip一起使用）")
 	flag.BoolVar(&help, "help", false, "显示帮助信息")
@@ -322,7 +296,6 @@ func main() {
 		fmt.Printf("用户: %s\n", cfg.User)
 		fmt.Printf("密码: %s\n", cfg.Password)
 		fmt.Printf("运营商: %s\n", cfg.NetType)
-		fmt.Printf("学生模式: %t\n", cfg.StudentMode)
 		if cfg.RouterIP != "" && cfg.RouterMAC != "" {
 			fmt.Printf("路由器模式: IP=%s, MAC=%s\n", cfg.RouterIP, cfg.RouterMAC)
 		}
@@ -331,18 +304,16 @@ func main() {
 		user = cfg.User
 		passwd = cfg.Password
 		nettype = cfg.NetType
-		studentMode = cfg.StudentMode
 		ip = cfg.RouterIP
 		mac = cfg.RouterMAC
 	} else if user != "" && passwd != "" {
 		// 从命令行参数加载
 		cfg := &Config{
-			User:        user,
-			Password:    passwd,
-			NetType:     nettype,
-			StudentMode: studentMode,
-			RouterIP:    ip,
-			RouterMAC:   mac,
+			User:      user,
+			Password:  passwd,
+			NetType:   nettype,
+			RouterIP:  ip,
+			RouterMAC: mac,
 		}
 
 		// 校验运营商类型
@@ -369,7 +340,6 @@ func main() {
 		fmt.Printf("用户: %s\n", cfg.User)
 		fmt.Printf("密码: %s\n", cfg.Password)
 		fmt.Printf("运营商: %s\n", cfg.NetType)
-		fmt.Printf("学生模式: %t\n", cfg.StudentMode)
 		if cfg.RouterIP != "" && cfg.RouterMAC != "" {
 			fmt.Printf("路由器模式: IP=%s, MAC=%s\n", cfg.RouterIP, cfg.RouterMAC)
 		}
@@ -378,7 +348,6 @@ func main() {
 		cfg.User = user
 		cfg.Password = passwd
 		cfg.NetType = nettype
-		cfg.StudentMode = studentMode
 		cfg.RouterIP = ip
 		cfg.RouterMAC = mac
 	} else {
@@ -402,13 +371,6 @@ func main() {
 
 	// 主循环
 	for {
-		if shouldSkipLogin(&Config{
-			StudentMode: studentMode,
-		}) {
-			time.Sleep(1 * time.Second)
-			continue
-		}
-
 		if !isNetworkOK() {
 			fmt.Println("⚠️ 检测到断网，正在重新登录...")
 			login(&Config{
