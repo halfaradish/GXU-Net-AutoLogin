@@ -1,0 +1,10 @@
+# 运行配置与日志不入库：
+# .env 里是账号密码与本机/路由器信息，只提交 .env.example 作模板
+.env
+
+# 日志：LOG_TO_FILE=true 时生成，含认证 IP / MAC 等信息
+*.log
+*.log.[0-9]*
+
+# 跑 tools/ 里的 Python 脚本时产生的字节码缓存
+__pycache__/

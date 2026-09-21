@@ -3,9 +3,11 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"strings"
 	"net/http"
 	"net"
@@ -16,7 +18,10 @@ import (
 )
 
 const (
-	configFileName = "config.txt"
+	configFileName = ".env"
+
+	// 老版本用 config.txt；现在找不到 .env 时如果发现它还在，就提示改名而不是重开一个新配置
+	legacyConfigFileName = "config.txt"
 
 	// ── 探测 ──────────────────────────────────────────────
 	// 超时留足余量：实测校园网有线 p99=72ms，WiFi 出现过 619ms 的延迟尖峰，
@@ -41,7 +46,148 @@ const (
 	quietAfter         = 20 * time.Minute
 	quietProbeInterval = 60 * time.Second
 	quietLoginInterval = 5 * time.Minute
+
+	// ── 日志 ──────────────────────────────────────────────
+	// Log_To_File 打开时，每行日志同时写控制台与该文件；写满后轮转，
+	// 只保留最近的 logBackups 份，避免长期挂机把磁盘写满。
+	defaultLogFileName = "GXU_Net_AutoLogin.log" // Log_File 留空时，写在程序当前目录
+	logMaxSize         = 5 << 20                 // 单个日志文件上限
+	logBackups         = 2                       // 保留的份数：.1、.2（更老的删除）
 )
+
+// ═══════════════════════════ 日志 ═══════════════════════════
+//
+// 所有输出都走 logInfo/logWarn/logError，控制台与日志文件拿到同一份文本：
+// 文案保留 emoji 便于肉眼扫，前缀的时间戳与级别便于按时间对齐和 grep。
+
+type logLevel int
+
+const (
+	lvlInfo logLevel = iota
+	lvlWarn
+	lvlError
+)
+
+func (l logLevel) String() string {
+	switch l {
+	case lvlWarn:
+		return "WARN"
+	case lvlError:
+		return "ERROR"
+	default:
+		return "INFO"
+	}
+}
+
+// logFileSink 非 nil 时日志同时写入文件（由 setupLogFile 设置）
+var logFileSink *rotatingFile
+
+func logf(lv logLevel, format string, args ...any) {
+	line := time.Now().Format("2006-01-02 15:04:05") +
+		" [" + lv.String() + "] " + fmt.Sprintf(format, args...) + "\n"
+
+	os.Stdout.WriteString(line)
+
+	if logFileSink != nil {
+		if _, err := logFileSink.Write([]byte(line)); err != nil {
+			// 日志文件不可写不能拖垮守护进程：报一次，之后只打印到控制台
+			fmt.Fprintf(os.Stdout, "%s [WARN] ⚠️ 日志文件写入失败，后续仅打印到控制台: %v\n",
+				time.Now().Format("2006-01-02 15:04:05"), err)
+			logFileSink.Close()
+			logFileSink = nil
+		}
+	}
+}
+
+func logInfo(format string, args ...any)  { logf(lvlInfo, format, args...) }
+func logWarn(format string, args ...any)  { logf(lvlWarn, format, args...) }
+func logError(format string, args ...any) { logf(lvlError, format, args...) }
+
+// rotatingFile 按大小轮转的追加写入器：写满后把当前文件改名为 .1，
+// 原来的 .1 变 .2，更老的丢弃，然后重开一个空文件继续写。
+type rotatingFile struct {
+	path    string
+	maxSize int64
+	backups int
+	f       *os.File
+	size    int64
+}
+
+func openLogFile(path string) (*rotatingFile, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, err
+	}
+
+	// 追加模式：重启后接着写同一个文件，大小以现有内容为起点
+	size := int64(0)
+	if st, err := f.Stat(); err == nil {
+		size = st.Size()
+	}
+
+	return &rotatingFile{path: path, maxSize: logMaxSize, backups: logBackups, f: f, size: size}, nil
+}
+
+func (w *rotatingFile) Write(p []byte) (int, error) {
+	if w.size+int64(len(p)) > w.maxSize {
+		if err := w.rotate(); err != nil {
+			return 0, err
+		}
+	}
+	n, err := w.f.Write(p)
+	w.size += int64(n)
+	return n, err
+}
+
+func (w *rotatingFile) rotate() error {
+	w.f.Close()
+
+	// 改名是尽力而为：被别的进程占用（例如编辑器打开着 .1）时只是这一轮没轮转成功，
+	// 后面重开的文件继续写，不影响日志本身
+	os.Remove(fmt.Sprintf("%s.%d", w.path, w.backups))
+	for i := w.backups - 1; i >= 1; i-- {
+		os.Rename(fmt.Sprintf("%s.%d", w.path, i), fmt.Sprintf("%s.%d", w.path, i+1))
+	}
+	os.Rename(w.path, w.path+".1")
+
+	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	w.f, w.size = f, 0
+	return nil
+}
+
+func (w *rotatingFile) Close() error {
+	if w == nil || w.f == nil {
+		return nil
+	}
+	return w.f.Close()
+}
+
+// setupLogFile 按配置打开日志文件；失败只警告，不影响程序继续运行。
+// 返回实际使用的路径（失败时为空）。
+func setupLogFile(enabled bool, path string) string {
+	if !enabled {
+		return ""
+	}
+	if path == "" {
+		path = defaultLogFileName
+	}
+
+	f, err := openLogFile(path)
+	if err != nil {
+		logWarn("⚠️ 无法写入日志文件 %s：%v（仅打印到控制台）", path, err)
+		return ""
+	}
+	logFileSink = f
+
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = path
+	}
+	return abs
+}
 
 // loginBackoff 登录失败后的重试退避序列（附加 ±20% 抖动）
 var loginBackoff = []time.Duration{
@@ -62,28 +208,42 @@ type Config struct {
 	// 路由器模式（当两者都非空时启用）
 	RouterIP  string
 	RouterMAC string
+
+	// 日志文件（仅在配置文件模式下使用；命令行模式见 -log / -logfile）
+	LogToFile bool
+	LogPath   string
 }
 
-// loadConfig 加载或创建配置文件
+// loadConfig 加载或创建 .env 配置（键名不区分大小写，值可以用引号包起来）
 func loadConfig() (*Config, error) {
 	// 检查文件是否存在
 	if _, err := os.Stat(configFileName); os.IsNotExist(err) {
+		// 老版本用的是 config.txt：提示改名，别让已有账号密码看起来"丢了"
+		if _, legacy := os.Stat(legacyConfigFileName); legacy == nil {
+			return nil, fmt.Errorf("配置已改用 %s，但检测到旧的 %s：请改成 %s 后重新运行（键名大小写不限）",
+				configFileName, legacyConfigFileName, configFileName)
+		}
+
 		// 创建默认模板
 		defaultContent := `# 校园网登陆脚本信息设置：（注意请不要改变格式）
-# 用户名：（填写示例：User=1807210721）
-User=
-# 密码：（填写示例：Password=www.nekopara.uk）
-Password=
+# 用户名：（填写示例：USER=1807210721）
+USER=
+# 密码：（填写示例：PASSWORD=www.nekopara.uk）
+PASSWORD=
 # 运营商选择，留空选择校园网，如果需要选择运营商，电信填写telecom，联通填写unicom，移动填写cmcc
-Net_Type=
+NET_TYPE=
 # 开启路由器登陆模式：
 # 如果填写以下两个参数（均非空），则使用指定的路由器IP和MAC进行认证。
 # 否则使用本机IP和MAC。
 # 示例：
-# Router_IP=172.16.6.6
-# Router_MAC=36:88:8A:99:A4:CC
-Router_IP=
-Router_MAC=
+# ROUTER_IP=172.16.6.6
+# ROUTER_MAC=36:88:8A:99:A4:CC
+ROUTER_IP=
+ROUTER_MAC=
+# 日志：（是否把日志同时写入文件，留空或 false 只打印到控制台）
+LOG_TO_FILE=
+# 日志文件路径：（留空则使用程序目录下的 GXU_Net_AutoLogin.log）
+LOG_FILE=
 `
 
 			err = os.WriteFile(configFileName, []byte(defaultContent), 0644)
@@ -118,17 +278,40 @@ Router_MAC=
 		key := strings.TrimSpace(parts[0])
 		value := strings.TrimSpace(parts[1])
 
-		switch key {
-			case "User":
+		// .env 习惯把值用引号包起来，这里接受 "…" 与 '…' 两种写法
+		if len(value) >= 2 {
+			if (value[0] == '"' && value[len(value)-1] == '"') ||
+				(value[0] == '\'' && value[len(value)-1] == '\'') {
+				value = value[1 : len(value)-1]
+			}
+		}
+
+		// 键名不区分大小写：.env 里习惯写全大写，旧 config.txt 里的写法也照旧能用
+		switch strings.ToLower(key) {
+			case "user":
 				cfg.User = value
-			case "Password":
+			case "password":
 				cfg.Password = value
-			case "Net_Type":
-				cfg.NetType = value // 新增这一行
-			case "Router_IP":
+			case "net_type":
+				cfg.NetType = value
+			case "router_ip":
 				cfg.RouterIP = value
-			case "Router_MAC":
+			case "router_mac":
 				cfg.RouterMAC = value
+			case "log_to_file":
+				// 留空 = 不写文件，与新增该键之前的行为一致
+				switch strings.ToLower(value) {
+				case "":
+					cfg.LogToFile = false
+				case "true", "1", "yes", "on":
+					cfg.LogToFile = true
+				case "false", "0", "no", "off":
+					cfg.LogToFile = false
+				default:
+					return nil, fmt.Errorf("错误：LOG_TO_FILE 只能填 true 或 false（留空表示不写文件），当前值: %s", value)
+				}
+			case "log_file":
+				cfg.LogPath = value
 		}
 	}
 
@@ -224,17 +407,142 @@ func getMACAddress() (string, error) {
 	return "", fmt.Errorf("no active network interface with MAC found")
 }
 
-func isNetworkOK() bool {
+// failKind 探测失败的类别，用于日志与恢复时的统计
+type failKind int
+
+const (
+	failNone failKind = iota
+	failTimeout
+	failDNS
+	failConn
+	failStatus
+)
+
+func (k failKind) String() string {
+	switch k {
+	case failTimeout:
+		return "超时"
+	case failDNS:
+		return "DNS 解析失败"
+	case failConn:
+		return "连接失败"
+	case failStatus:
+		return "非 204 响应"
+	default:
+		return "未知原因"
+	}
+}
+
+// probeFailure 一次探测失败的详情（成功时为零值）
+type probeFailure struct {
+	kind   failKind
+	detail string // 面向日志：类别 + 具体错误
+}
+
+// isNetworkOK 探测出口是否可达；失败时把原因一并带出来，便于排障与统计
+func isNetworkOK() (bool, probeFailure) {
 	client := &http.Client{
 		Timeout: probeTimeout,
 	}
 	resp, err := client.Get(probeURL)
 	if err != nil {
-		return false // 网络不通 / DNS 故障 / 超时
+		kind, detail := errKind(err, probeTimeout) // 网络不通 / DNS 故障 / 超时
+		return false, probeFailure{kind: kind, detail: detail}
 	}
 	defer resp.Body.Close()
 
-	return resp.StatusCode == 204
+	if resp.StatusCode != 204 {
+		return false, probeFailure{kind: failStatus, detail: fmt.Sprintf("非 204 响应：HTTP %d", resp.StatusCode)}
+	}
+	return true, probeFailure{}
+}
+
+// errKind 归类网络错误，并给出可写进日志的简短描述。timeout 是本次请求的超时预算，
+// 用于把超时的原始报错（context deadline exceeded…）换成人话。
+//
+// 描述里必须去掉 *url.Error 的 URL：它会把整个请求 URL 抄一遍，而登录 URL 带着
+// user_password 参数——直接把 err 打进日志等于把密码写进日志（旧版就是这样）。
+func errKind(err error, timeout time.Duration) (failKind, string) {
+	kind := failConn
+
+	// *url.Error 自己实现了 net.Error，因此超时判定要放在解包之前
+	var dnsErr *net.DNSError
+	var netErr net.Error
+	switch {
+	case errors.As(err, &dnsErr):
+		kind = failDNS
+	case errors.As(err, &netErr) && netErr.Timeout():
+		kind = failTimeout
+	}
+
+	if kind == failTimeout {
+		return kind, fmt.Sprintf("%s：%s 内无响应", kind, timeout)
+	}
+
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		err = urlErr.Err
+	}
+
+	s := err.Error()
+	if r := []rune(s); len(r) > 120 {
+		s = string(r[:120]) + "…"
+	}
+	return kind, fmt.Sprintf("%s：%s", kind, s)
+}
+
+// outageStat 一次断网期间按原因累计的失败次数
+type outageStat struct {
+	probes  int
+	timeout int
+	dns     int
+	conn    int
+	status  int
+}
+
+func (s *outageStat) reset() { *s = outageStat{} }
+
+func (s *outageStat) add(f probeFailure) {
+	s.probes++
+	switch f.kind {
+	case failTimeout:
+		s.timeout++
+	case failDNS:
+		s.dns++
+	case failConn:
+		s.conn++
+	case failStatus:
+		s.status++
+	}
+}
+
+// summary 拼出"期间失败 N 次：超时 a、连接失败 b"这样的统计；没有任何失败时返回空串
+func (s outageStat) summary() string {
+	if s.probes == 0 {
+		return ""
+	}
+
+	parts := make([]string, 0, 4)
+	for _, p := range []struct {
+		name string
+		n    int
+	}{
+		{failTimeout.String(), s.timeout},
+		{failConn.String(), s.conn},
+		{failDNS.String(), s.dns},
+		{failStatus.String(), s.status},
+	} {
+		if p.n > 0 {
+			parts = append(parts, fmt.Sprintf("%s %d", p.name, p.n))
+		}
+	}
+
+	detail := fmt.Sprintf("%d 次", s.probes)
+	if len(parts) > 0 {
+		// 用冒号而不是括号：恢复那行整体已经在括号里，避免套两层括号
+		detail += "：" + strings.Join(parts, "、")
+	}
+	return "；期间探测失败 " + detail
 }
 
 // loginOutcome 描述一次登录尝试的结果
@@ -310,7 +618,9 @@ func login(cfg *Config, ip, mac string) loginOutcome {
 	client := &http.Client{Timeout: loginTimeout}
 	resp, err := client.Get(loginURL)
 	if err != nil {
-		return loginOutcome{err: err}
+		// 只保留归类后的描述：*url.Error 原文会把含 user_password 的完整 URL 抄进消息
+		_, detail := errKind(err, loginTimeout)
+		return loginOutcome{err: errors.New(detail)}
 	}
 	defer resp.Body.Close()
 
@@ -355,19 +665,19 @@ func jitter(d time.Duration) time.Duration {
 func getLoginInfo(cfg *Config) (ip, mac string, err error) {
 	// 如果启用了路由器模式（两个字段都非空）
 	if cfg.RouterIP != "" && cfg.RouterMAC != "" {
-		fmt.Println("🌐 使用路由器模式进行认证")
+		logInfo("🌐 使用路由器模式进行认证")
 		return cfg.RouterIP, cfg.RouterMAC, nil
 	}
 
 	// 否则使用本机信息
-	fmt.Println("💻 使用本机模式进行认证")
+	logInfo("💻 使用本机模式进行认证")
 	ip, err = getLocalIP()
 	if err != nil {
 		return "", "", fmt.Errorf("获取本机IP失败: %w", err)
 	}
 	mac, err = getMACForIP(ip)
 	if err != nil {
-		fmt.Printf("⚠️ %v，回退为自动选择网卡\n", err)
+		logWarn("⚠️ %v，回退为自动选择网卡", err)
 		mac, err = getMACAddress()
 		if err != nil {
 			return "", "", fmt.Errorf("获取本机MAC失败: %w", err)
@@ -386,11 +696,14 @@ func printHelp() {
 -nettype   运营商类型（telecom, unicom, cmcc），不加参数则使用校园网
 -ip        路由器IP（必须与-mac一起使用）
 -mac       路由器MAC（必须与-ip一起使用）
+-log       把日志同时写入文件（默认只打印到控制台）
+-logfile   日志文件路径（默认程序目录下的 GXU_Net_AutoLogin.log）
 -help      显示此帮助信息
 
 示例（Linux）：
 ./GXU_Net_AutoLogin -user 1807210721 -passwd mypassword
 /opt/GXU_Net_AutoLogin/GXU_Net_AutoLogin -user 1807210721 -passwd mypassword -nettype telecom
+./GXU_Net_AutoLogin -user 1807210721 -passwd mypassword -log -logfile /var/log/gxu.log
 ./GXU_Net_AutoLogin -user 1807210721 -passwd mypassword -ip 172.16.6.6 -mac 36:88:8A:99:A4:CC
 
 示例（Windows）：
@@ -401,7 +714,6 @@ C:\\Program Files\\GXU_Net_AutoLogin\\GXU_Net_AutoLogin.exe -user 1807210721 -pa
 }
 
 func main() {
-	fmt.Printf("🚀广西大学校园网自动登陆程序 By：GTX690战术核显卡导弹（www.nekopara.uk）\n")
 	// 定义命令行参数
 	var (
 		user    string
@@ -410,6 +722,8 @@ func main() {
 		ip      string
 		mac     string
 		help    bool
+		logFlag bool
+		logPath string
 	)
 
 	flag.StringVar(&user, "user", "", "用户名")
@@ -417,48 +731,34 @@ func main() {
 	flag.StringVar(&nettype, "nettype", "", "运营商类型（telecom, unicom, cmcc）")
 	flag.StringVar(&ip, "ip", "", "路由器IP（必须与-mac一起使用）")
 	flag.StringVar(&mac, "mac", "", "路由器MAC（必须与-ip一起使用）")
+	flag.BoolVar(&logFlag, "log", false, "把日志同时写入文件")
+	flag.StringVar(&logPath, "logfile", "", "日志文件路径（默认程序目录下的 GXU_Net_AutoLogin.log）")
 	flag.BoolVar(&help, "help", false, "显示帮助信息")
 	flag.Parse()
 
-	// 显示帮助信息
+	// 显示帮助信息（此时还没解析配置，也就没有日志文件）
 	if help {
 		printHelp()
 		os.Exit(0)
 	}
 
-	// 检查必须参数
-	if (user == "" && passwd == "") {
+	// 解析配置来源。这一步只收集参数、不打印：等日志文件开好之后再统一输出启动信息，
+	// 这样日志文件里从第一行起就是完整的一次会话
+	var cfg *Config
+	source := ""
+	switch {
+	case user == "" && passwd == "":
 		// 从配置文件加载
-		cfg, err := loadConfig()
+		c, err := loadConfig()
 		if err != nil {
 			fmt.Println("❌ 错误:", err)
-			fmt.Println("💡 请编辑 config.txt 后重新运行本程序。")
+			fmt.Printf("💡 请编辑 %s 后重新运行本程序。\n", configFileName)
 			os.Exit(1)
 		}
-		fmt.Printf("✅ 配置加载成功！\n")
-		fmt.Printf("用户: %s\n", cfg.User)
-		fmt.Printf("密码: ******（%d 字符）\n", len([]rune(cfg.Password)))
-		fmt.Printf("运营商: %s\n", cfg.NetType)
-		if cfg.RouterIP != "" && cfg.RouterMAC != "" {
-			fmt.Printf("路由器模式: IP=%s, MAC=%s\n", cfg.RouterIP, cfg.RouterMAC)
-		}
+		cfg, source = c, "配置文件"
 
-		// 修复：将配置文件中的值赋给命令行变量
-		user = cfg.User
-		passwd = cfg.Password
-		nettype = cfg.NetType
-		ip = cfg.RouterIP
-		mac = cfg.RouterMAC
-	} else if user != "" && passwd != "" {
+	case user != "" && passwd != "":
 		// 从命令行参数加载
-		cfg := &Config{
-			User:      user,
-			Password:  passwd,
-			NetType:   nettype,
-			RouterIP:  ip,
-			RouterMAC: mac,
-		}
-
 		// 校验运营商类型
 		if nettype != "" {
 			valid := false
@@ -478,80 +778,102 @@ func main() {
 			os.Exit(1)
 		}
 
-		// 显示配置
-		fmt.Printf("✅ 命令行参数加载成功！\n")
-		fmt.Printf("用户: %s\n", cfg.User)
-		fmt.Printf("密码: ******（%d 字符）\n", len([]rune(cfg.Password)))
-		fmt.Printf("运营商: %s\n", cfg.NetType)
-		if cfg.RouterIP != "" && cfg.RouterMAC != "" {
-			fmt.Printf("路由器模式: IP=%s, MAC=%s\n", cfg.RouterIP, cfg.RouterMAC)
-		}
+		cfg, source = &Config{
+			User:      user,
+			Password:  passwd,
+			NetType:   nettype,
+			RouterIP:  ip,
+			RouterMAC: mac,
+		}, "命令行参数"
 
-		// 使用命令行参数配置
-		cfg.User = user
-		cfg.Password = passwd
-		cfg.NetType = nettype
-		cfg.RouterIP = ip
-		cfg.RouterMAC = mac
-	} else {
+	default:
 		// 只提供了其中一个参数
 		fmt.Println("❌ 错误：必须同时提供user和passwd参数，或者都不提供（通过配置文件）")
 		fmt.Println("💡 请使用 -help 查看参数说明")
 		os.Exit(1)
 	}
 
+	// 日志：配置文件里的 Log_To_File 与命令行 -log 取并集，-logfile 优先于 Log_File。
+	// 两种启动方式都要能开——服务部署走的是命令行参数，根本不读 .env
+	logEnabled := cfg.LogToFile || logFlag
+	if logPath == "" {
+		logPath = cfg.LogPath
+	}
+	logFilePath := setupLogFile(logEnabled, logPath)
+
+	logInfo("🚀广西大学校园网自动登陆程序 By：GTX690战术核显卡导弹（www.nekopara.uk）")
+	logInfo("✅ %s加载成功！", source)
+	logInfo("用户: %s", cfg.User)
+	logInfo("密码: ******（%d 字符）", len([]rune(cfg.Password)))
+	logInfo("运营商: %s", cfg.NetType)
+	if cfg.RouterIP != "" && cfg.RouterMAC != "" {
+		logInfo("路由器模式: IP=%s, MAC=%s", cfg.RouterIP, cfg.RouterMAC)
+	}
+	if logFilePath != "" {
+		logInfo("📝 日志文件: %s（单文件上限 %d MiB，保留 %d 个备份）", logFilePath, logMaxSize>>20, logBackups)
+	}
+
 	// 获取用于登录的 IP 和 MAC（自动判断模式）
 	ipAddr, macAddr, err := getLoginInfo(&Config{
-		RouterIP:  ip,
-		RouterMAC: mac,
+		RouterIP:  cfg.RouterIP,
+		RouterMAC: cfg.RouterMAC,
 	})
 	if err != nil {
-		fmt.Printf("❌ %v\n", err)
+		logError("❌ %v", err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("✅ 守护进程启动：认证IP=%s | 认证MAC=%s\n", ipAddr, macAddr)
-	fmt.Printf("   探测 %s（超时 %s｜在线间隔 %s｜失败后 %s｜连续 %d 次失败判定断网）\n",
+	logInfo("✅ 守护进程启动：认证IP=%s | 认证MAC=%s", ipAddr, macAddr)
+	logInfo("   探测 %s（超时 %s｜在线间隔 %s｜失败后 %s｜连续 %d 次失败判定断网）",
 		probeURL, probeTimeout, intervalOnline, intervalFast, failThreshold)
-	fmt.Printf("   连续断网超过 %.0f 分钟进入静默（探测 %.0f 秒｜每 %.0f 分钟尝试一次登录）\n",
+	logInfo("   连续断网超过 %.0f 分钟进入静默（探测 %.0f 秒｜每 %.0f 分钟尝试一次登录）",
 		quietAfter.Minutes(), quietProbeInterval.Seconds(), quietLoginInterval.Minutes())
 
 	// 主循环：连续失败才判定断网；探测间隔自适应；登录失败按退避重试；
 	// 长时间断网（如校园网 00:00-06:00 禁网时段）自动进入静默，避免整夜空转
-	loginCfg := &Config{User: user, Password: passwd, NetType: nettype}
+	loginCfg := &Config{User: cfg.User, Password: cfg.Password, NetType: cfg.NetType}
 	fails, fast, backoffIdx := 0, false, -1
 	downLogged, quietLogged := false, false
 	sessionAssumed := false // 服务器确认过会话（成功或 512）后为 true：此时探测失败不再加速探测
 	var nextLogin, outageSince time.Time
+	var stat outageStat // 本次断网期间按原因累计的失败次数
 
 	for {
-		if isNetworkOK() {
+		ok, fail := isNetworkOK()
+		if ok {
 			if downLogged || quietLogged { // 仅在状态切换时打印，避免刷屏
-				fmt.Printf("✅ 网络已恢复（断网持续 %s）\n", time.Since(outageSince).Round(time.Second))
+				logInfo("✅ 网络已恢复（断网持续 %s%s）",
+					time.Since(outageSince).Round(time.Second), stat.summary())
 			}
 			fails, fast, backoffIdx = 0, false, -1
 			downLogged, quietLogged, sessionAssumed = false, false, false
 			nextLogin, outageSince = time.Time{}, time.Time{}
+			stat.reset()
 			time.Sleep(intervalOnline)
 			continue
 		}
 
 		fails++
 		if outageSince.IsZero() {
+			// 本次断网的第一笔失败：记下起点、清空统计，并把失败原因写出来。
+			// 原先只报"判定断网"，看不出是超时、DNS 还是探测端点返回了异常状态码
 			outageSince = time.Now()
+			stat.reset()
+			logWarn("⚠️ 探测失败（%s），连续 %d 次失败即判定断网", fail.detail, failThreshold)
 		}
+		stat.add(fail)
 
 		// 长时断网静默：探测放慢、登录尝试固定低频，直到网络真的能出去为止。
 		// 不按日历判断，因此假期里网络正常时不会进入静默，假期里真断网也能按常规节奏快速恢复。
 		if time.Since(outageSince) >= quietAfter {
 			if !quietLogged {
 				quietLogged = true
-				fmt.Printf("🌙 已连续断网 %.0f 分钟，进入静默（探测 %.0f 秒、每 %.0f 分钟尝试一次登录）\n",
+				logWarn("🌙 已连续断网 %.0f 分钟，进入静默（探测 %.0f 秒、每 %.0f 分钟尝试一次登录）",
 					quietAfter.Minutes(), quietProbeInterval.Seconds(), quietLoginInterval.Minutes())
 			}
 			if time.Now().After(nextLogin) {
 				o := login(loginCfg, ipAddr, macAddr)
-				fmt.Printf("· 静默期登录尝试：%s\n", o.desc())
+				logInfo("· 静默期登录尝试：%s", o.desc())
 				nextLogin = time.Now().Add(quietLoginInterval)
 			}
 			// 睡到"下次探测"与"下次登录尝试"中较早的一个，避免尝试时刻被探测周期推后
@@ -572,26 +894,26 @@ func main() {
 		if fails >= failThreshold && time.Now().After(nextLogin) {
 			if !downLogged {
 				downLogged = true
-				fmt.Printf("⚠️ 连续 %d 次探测失败，判定断网，开始重连\n", fails)
+				logWarn("⚠️ 连续 %d 次探测失败，判定断网，开始重连", fails)
 			}
 			o := login(loginCfg, ipAddr, macAddr)
 			switch {
 			case o.success:
 				// 认证成功：进入冷却期，避免探测端点异常时反复登录
-				fmt.Printf("✅ %s\n", o.desc())
+				logInfo("✅ %s", o.desc())
 				fails, backoffIdx = 0, -1
 				sessionAssumed, fast = true, false
 				nextLogin = time.Now().Add(loginCooldown)
 			case o.alreadyUp:
 				// 该 IP 已有会话：探测失败更可能来自探测端点本身，放慢节奏
-				fmt.Printf("ℹ️ %s，%s 后才会再次尝试登录，期间继续探测\n", o.desc(), sessionRecheck)
+				logInfo("ℹ️ %s，%s 后才会再次尝试登录，期间继续探测", o.desc(), sessionRecheck)
 				sessionAssumed, fast = true, false
 				nextLogin = time.Now().Add(sessionRecheck)
 			default:
 				backoffIdx = nextBackoffIdx(backoffIdx)
 				d := jitter(loginBackoff[backoffIdx])
 				nextLogin = time.Now().Add(d)
-				fmt.Printf("⚠️ %s，%s 后重试\n", o.desc(), d.Round(time.Second))
+				logWarn("⚠️ %s，%s 后重试", o.desc(), d.Round(time.Second))
 			}
 		}
 
