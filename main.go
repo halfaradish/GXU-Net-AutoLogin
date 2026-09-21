@@ -48,9 +48,10 @@ const (
 	quietLoginInterval = 5 * time.Minute
 
 	// ── 日志 ──────────────────────────────────────────────
-	// Log_To_File 打开时，每行日志同时写控制台与该文件；写满后轮转，
+	// LOG_TO_FILE 打开时，每行日志同时写控制台与该文件；写满后轮转，
 	// 只保留最近的 logBackups 份，避免长期挂机把磁盘写满。
-	defaultLogFileName = "GXU_Net_AutoLogin.log" // Log_File 留空时，写在程序当前目录
+	defaultLogDir      = "logs"                  // LOG_FILE 留空时，日志放在程序当前目录的 logs/ 下（不存在会自动创建）
+	defaultLogFileName = "GXU_Net_AutoLogin.log" // 默认文件名
 	logMaxSize         = 5 << 20                 // 单个日志文件上限
 	logBackups         = 2                       // 保留的份数：.1、.2（更老的删除）
 )
@@ -172,7 +173,15 @@ func setupLogFile(enabled bool, path string) string {
 		return ""
 	}
 	if path == "" {
-		path = defaultLogFileName
+		path = filepath.Join(defaultLogDir, defaultLogFileName)
+	}
+
+	// 目录不存在就建：默认的 logs/，或 LOG_FILE 里写的多级路径
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			logWarn("⚠️ 无法创建日志目录 %s：%v（仅打印到控制台）", dir, err)
+			return ""
+		}
 	}
 
 	f, err := openLogFile(path)
@@ -242,7 +251,7 @@ ROUTER_IP=
 ROUTER_MAC=
 # 日志：（是否把日志同时写入文件，留空或 false 只打印到控制台）
 LOG_TO_FILE=
-# 日志文件路径：（留空则使用程序目录下的 GXU_Net_AutoLogin.log）
+# 日志文件路径：（留空则使用程序目录下的 logs/GXU_Net_AutoLogin.log）
 LOG_FILE=
 `
 
@@ -697,7 +706,7 @@ func printHelp() {
 -ip        路由器IP（必须与-mac一起使用）
 -mac       路由器MAC（必须与-ip一起使用）
 -log       把日志同时写入文件（默认只打印到控制台）
--logfile   日志文件路径（默认程序目录下的 GXU_Net_AutoLogin.log）
+-logfile   日志文件路径（默认程序目录下的 logs/GXU_Net_AutoLogin.log）
 -help      显示此帮助信息
 
 示例（Linux）：
@@ -732,7 +741,7 @@ func main() {
 	flag.StringVar(&ip, "ip", "", "路由器IP（必须与-mac一起使用）")
 	flag.StringVar(&mac, "mac", "", "路由器MAC（必须与-ip一起使用）")
 	flag.BoolVar(&logFlag, "log", false, "把日志同时写入文件")
-	flag.StringVar(&logPath, "logfile", "", "日志文件路径（默认程序目录下的 GXU_Net_AutoLogin.log）")
+	flag.StringVar(&logPath, "logfile", "", "日志文件路径（默认程序目录下的 logs/GXU_Net_AutoLogin.log）")
 	flag.BoolVar(&help, "help", false, "显示帮助信息")
 	flag.Parse()
 

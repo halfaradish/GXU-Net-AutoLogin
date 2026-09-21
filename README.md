@@ -70,7 +70,7 @@ ROUTER_IP=172.16.6.6
 ROUTER_MAC=36:88:8A:99:A4:CC
 # 日志：留空/false=只打印到控制台，true=同时写入文件
 LOG_TO_FILE=true
-# 日志文件路径：留空=程序目录下的 GXU_Net_AutoLogin.log
+# 日志文件路径：留空=程序目录下的 logs/GXU_Net_AutoLogin.log
 LOG_FILE=
 ```
 
@@ -121,7 +121,7 @@ LOG_FILE=
 这样运行 `run.vbs` 就不会显示黑窗口了。
 
 > 💡 隐藏运行后看不到控制台输出，建议把 `.env` 里的 `LOG_TO_FILE` 设为 `true`，
-> 之后直接看同目录下的 `GXU_Net_AutoLogin.log`（或 `-log -logfile D:\gxu.log`）。
+> 之后直接看同目录下 `logs/GXU_Net_AutoLogin.log`（或 `-log -logfile D:\gxu.log`）。
 
 如果你需要设置计划任务，记得使用**绝对路径，并制定对应的参数**，例如：
 

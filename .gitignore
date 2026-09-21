@@ -2,7 +2,8 @@
 # .env 里是账号密码与本机/路由器信息，只提交 .env.example 作模板
 .env
 
-# 日志：LOG_TO_FILE=true 时生成，含认证 IP / MAC 等信息
+# 日志：LOG_TO_FILE=true 时生成，含认证 IP / MAC 等信息（默认放在 logs/ 下）
+logs/
 *.log
 *.log.[0-9]*
 
