@@ -59,7 +59,7 @@ const (
 // ═══════════════════════════ 日志 ═══════════════════════════
 //
 // 所有输出都走 logInfo/logWarn/logError，控制台与日志文件拿到同一份文本：
-// 文案保留 emoji 便于肉眼扫，前缀的时间戳与级别便于按时间对齐和 grep。
+// 前缀的时间戳与级别便于按时间对齐和 grep。
 
 type logLevel int
 
@@ -92,7 +92,7 @@ func logf(lv logLevel, format string, args ...any) {
 	if logFileSink != nil {
 		if _, err := logFileSink.Write([]byte(line)); err != nil {
 			// 日志文件不可写不能拖垮守护进程：报一次，之后只打印到控制台
-			fmt.Fprintf(os.Stdout, "%s [WARN] ⚠️ 日志文件写入失败，后续仅打印到控制台: %v\n",
+			fmt.Fprintf(os.Stdout, "%s [WARN] 日志文件写入失败，后续仅打印到控制台: %v\n",
 				time.Now().Format("2006-01-02 15:04:05"), err)
 			logFileSink.Close()
 			logFileSink = nil
@@ -179,14 +179,14 @@ func setupLogFile(enabled bool, path string) string {
 	// 目录不存在就建：默认的 logs/，或 LOG_FILE 里写的多级路径
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0755); err != nil {
-			logWarn("⚠️ 无法创建日志目录 %s：%v（仅打印到控制台）", dir, err)
+			logWarn("无法创建日志目录 %s：%v（仅打印到控制台）", dir, err)
 			return ""
 		}
 	}
 
 	f, err := openLogFile(path)
 	if err != nil {
-		logWarn("⚠️ 无法写入日志文件 %s：%v（仅打印到控制台）", path, err)
+		logWarn("无法写入日志文件 %s：%v（仅打印到控制台）", path, err)
 		return ""
 	}
 	logFileSink = f
@@ -674,19 +674,19 @@ func jitter(d time.Duration) time.Duration {
 func getLoginInfo(cfg *Config) (ip, mac string, err error) {
 	// 如果启用了路由器模式（两个字段都非空）
 	if cfg.RouterIP != "" && cfg.RouterMAC != "" {
-		logInfo("🌐 使用路由器模式进行认证")
+		logInfo("使用路由器模式进行认证")
 		return cfg.RouterIP, cfg.RouterMAC, nil
 	}
 
 	// 否则使用本机信息
-	logInfo("💻 使用本机模式进行认证")
+	logInfo("使用本机模式进行认证")
 	ip, err = getLocalIP()
 	if err != nil {
 		return "", "", fmt.Errorf("获取本机IP失败: %w", err)
 	}
 	mac, err = getMACForIP(ip)
 	if err != nil {
-		logWarn("⚠️ %v，回退为自动选择网卡", err)
+		logWarn("%v，回退为自动选择网卡", err)
 		mac, err = getMACAddress()
 		if err != nil {
 			return "", "", fmt.Errorf("获取本机MAC失败: %w", err)
@@ -760,8 +760,8 @@ func main() {
 		// 从配置文件加载
 		c, err := loadConfig()
 		if err != nil {
-			fmt.Println("❌ 错误:", err)
-			fmt.Printf("💡 请编辑 %s 后重新运行本程序。\n", configFileName)
+			fmt.Println("错误:", err)
+			fmt.Printf("请编辑 %s 后重新运行本程序。\n", configFileName)
 			os.Exit(1)
 		}
 		cfg, source = c, "配置文件"
@@ -776,14 +776,14 @@ func main() {
 					valid = true
 			}
 			if !valid {
-				fmt.Printf("❌ 错误：运营商类型必须为telecom, unicom, cmcc（不区分大小写），当前值: %s\n", nettype)
+				fmt.Printf("错误：运营商类型必须为telecom, unicom, cmcc（不区分大小写），当前值: %s\n", nettype)
 				os.Exit(1)
 			}
 		}
 
 		// 校验路由器IP/MAC
 		if (ip != "" && mac == "") || (ip == "" && mac != "") {
-			fmt.Println("❌ 错误：必须同时提供ip和mac参数，两者缺一不可")
+			fmt.Println("错误：必须同时提供ip和mac参数，两者缺一不可")
 			os.Exit(1)
 		}
 
@@ -797,8 +797,8 @@ func main() {
 
 	default:
 		// 只提供了其中一个参数
-		fmt.Println("❌ 错误：必须同时提供user和passwd参数，或者都不提供（通过配置文件）")
-		fmt.Println("💡 请使用 -help 查看参数说明")
+		fmt.Println("错误：必须同时提供user和passwd参数，或者都不提供（通过配置文件）")
+		fmt.Println("请使用 -help 查看参数说明")
 		os.Exit(1)
 	}
 
@@ -810,8 +810,8 @@ func main() {
 	}
 	logFilePath := setupLogFile(logEnabled, logPath)
 
-	logInfo("🚀广西大学校园网自动登陆程序 By：GTX690战术核显卡导弹（www.nekopara.uk）")
-	logInfo("✅ %s加载成功！", source)
+	logInfo("广西大学校园网自动登陆程序 By：GTX690战术核显卡导弹（www.nekopara.uk）")
+	logInfo("%s加载成功！", source)
 	logInfo("用户: %s", cfg.User)
 	logInfo("密码: ******（%d 字符）", len([]rune(cfg.Password)))
 	logInfo("运营商: %s", cfg.NetType)
@@ -819,7 +819,7 @@ func main() {
 		logInfo("路由器模式: IP=%s, MAC=%s", cfg.RouterIP, cfg.RouterMAC)
 	}
 	if logFilePath != "" {
-		logInfo("📝 日志文件: %s（单文件上限 %d MiB，保留 %d 个备份）", logFilePath, logMaxSize>>20, logBackups)
+		logInfo("日志文件: %s（单文件上限 %d MiB，保留 %d 个备份）", logFilePath, logMaxSize>>20, logBackups)
 	}
 
 	// 获取用于登录的 IP 和 MAC（自动判断模式）
@@ -828,11 +828,11 @@ func main() {
 		RouterMAC: cfg.RouterMAC,
 	})
 	if err != nil {
-		logError("❌ %v", err)
+		logError("%v", err)
 		os.Exit(1)
 	}
 
-	logInfo("✅ 守护进程启动：认证IP=%s | 认证MAC=%s", ipAddr, macAddr)
+	logInfo("守护进程启动：认证IP=%s | 认证MAC=%s", ipAddr, macAddr)
 	logInfo("   探测 %s（超时 %s｜在线间隔 %s｜失败后 %s｜连续 %d 次失败判定断网）",
 		probeURL, probeTimeout, intervalOnline, intervalFast, failThreshold)
 	logInfo("   连续断网超过 %.0f 分钟进入静默（探测 %.0f 秒｜每 %.0f 分钟尝试一次登录）",
@@ -851,7 +851,7 @@ func main() {
 		ok, fail := isNetworkOK()
 		if ok {
 			if downLogged || quietLogged { // 仅在状态切换时打印，避免刷屏
-				logInfo("✅ 网络已恢复（断网持续 %s%s）",
+				logInfo("网络已恢复（断网持续 %s%s）",
 					time.Since(outageSince).Round(time.Second), stat.summary())
 			}
 			fails, fast, backoffIdx = 0, false, -1
@@ -868,7 +868,7 @@ func main() {
 			// 原先只报"判定断网"，看不出是超时、DNS 还是探测端点返回了异常状态码
 			outageSince = time.Now()
 			stat.reset()
-			logWarn("⚠️ 探测失败（%s），连续 %d 次失败即判定断网", fail.detail, failThreshold)
+			logWarn("探测失败（%s），连续 %d 次失败即判定断网", fail.detail, failThreshold)
 		}
 		stat.add(fail)
 
@@ -877,7 +877,7 @@ func main() {
 		if time.Since(outageSince) >= quietAfter {
 			if !quietLogged {
 				quietLogged = true
-				logWarn("🌙 已连续断网 %.0f 分钟，进入静默（探测 %.0f 秒、每 %.0f 分钟尝试一次登录）",
+				logWarn("已连续断网 %.0f 分钟，进入静默（探测 %.0f 秒、每 %.0f 分钟尝试一次登录）",
 					quietAfter.Minutes(), quietProbeInterval.Seconds(), quietLoginInterval.Minutes())
 			}
 			if time.Now().After(nextLogin) {
@@ -903,26 +903,26 @@ func main() {
 		if fails >= failThreshold && time.Now().After(nextLogin) {
 			if !downLogged {
 				downLogged = true
-				logWarn("⚠️ 连续 %d 次探测失败，判定断网，开始重连", fails)
+				logWarn("连续 %d 次探测失败，判定断网，开始重连", fails)
 			}
 			o := login(loginCfg, ipAddr, macAddr)
 			switch {
 			case o.success:
 				// 认证成功：进入冷却期，避免探测端点异常时反复登录
-				logInfo("✅ %s", o.desc())
+				logInfo("%s", o.desc())
 				fails, backoffIdx = 0, -1
 				sessionAssumed, fast = true, false
 				nextLogin = time.Now().Add(loginCooldown)
 			case o.alreadyUp:
 				// 该 IP 已有会话：探测失败更可能来自探测端点本身，放慢节奏
-				logInfo("ℹ️ %s，%s 后才会再次尝试登录，期间继续探测", o.desc(), sessionRecheck)
+				logInfo("%s，%s 后才会再次尝试登录，期间继续探测", o.desc(), sessionRecheck)
 				sessionAssumed, fast = true, false
 				nextLogin = time.Now().Add(sessionRecheck)
 			default:
 				backoffIdx = nextBackoffIdx(backoffIdx)
 				d := jitter(loginBackoff[backoffIdx])
 				nextLogin = time.Now().Add(d)
-				logWarn("⚠️ %s，%s 后重试", o.desc(), d.Round(time.Second))
+				logWarn("%s，%s 后重试", o.desc(), d.Round(time.Second))
 			}
 		}
 
