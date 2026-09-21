@@ -33,6 +33,14 @@ const (
 	loginTimeout   = 5 * time.Second // 原先 http.Get 无超时，是唯一会永久卡死的地方
 	loginCooldown  = 5 * time.Minute // 认证成功后：探测恢复之前不再重复登录
 	sessionRecheck = 1 * time.Minute // 服务器报告"已有会话"后：隔多久再尝试一次登录
+
+	// ── 长时断网静默（替代原"学生模式"）────────────────────
+	// 校园网会在 00:00-06:00 强制断网，但该策略随学期 / 假期 / 在校人数变化
+	// （假期与开学期间并不一致），因此不按日历判断：连续探测失败超过 quietAfter
+	// 即进入静默，避免整夜高频空转；探测一旦成功就立刻回到常规节奏。
+	quietAfter         = 20 * time.Minute
+	quietProbeInterval = 60 * time.Second
+	quietLoginInterval = 5 * time.Minute
 )
 
 // loginBackoff 登录失败后的重试退避序列（附加 ±20% 抖动）
@@ -503,59 +511,87 @@ func main() {
 	}
 
 	fmt.Printf("✅ 守护进程启动：认证IP=%s | 认证MAC=%s\n", ipAddr, macAddr)
-	fmt.Printf("   探测 %s\n", probeURL)
-	fmt.Printf("   超时 %s｜在线间隔 %s｜失败后 %s｜连续 %d 次失败判定断网\n",
-		probeTimeout, intervalOnline, intervalFast, failThreshold)
+	fmt.Printf("   探测 %s（超时 %s｜在线间隔 %s｜失败后 %s｜连续 %d 次失败判定断网）\n",
+		probeURL, probeTimeout, intervalOnline, intervalFast, failThreshold)
+	fmt.Printf("   连续断网超过 %.0f 分钟进入静默（探测 %.0f 秒｜每 %.0f 分钟尝试一次登录）\n",
+		quietAfter.Minutes(), quietProbeInterval.Seconds(), quietLoginInterval.Minutes())
 
-	// 主循环：连续失败才判定断网；探测间隔自适应；登录失败按退避重试
+	// 主循环：连续失败才判定断网；探测间隔自适应；登录失败按退避重试；
+	// 长时间断网（如校园网 00:00-06:00 禁网时段）自动进入静默，避免整夜空转
 	loginCfg := &Config{User: user, Password: passwd, NetType: nettype}
 	fails, fast, backoffIdx := 0, false, -1
-	downLogged := false
+	downLogged, quietLogged := false, false
 	sessionAssumed := false // 服务器确认过会话（成功或 512）后为 true：此时探测失败不再加速探测
-	var nextLogin, downSince time.Time
+	var nextLogin, outageSince time.Time
 
 	for {
 		if isNetworkOK() {
-			if downLogged { // 仅在状态切换时打印，避免刷屏
-				fmt.Printf("✅ 网络已恢复（断网持续 %s）\n", time.Since(downSince).Round(time.Second))
+			if downLogged || quietLogged { // 仅在状态切换时打印，避免刷屏
+				fmt.Printf("✅ 网络已恢复（断网持续 %s）\n", time.Since(outageSince).Round(time.Second))
 			}
-			fails, fast, backoffIdx, downLogged = 0, false, -1, false
-			sessionAssumed = false
-			nextLogin, downSince = time.Time{}, time.Time{}
-		} else {
-			fails++
-			// 会话已确认时探测失败更可能来自探测端点本身，保持在线档间隔，避免高频空探
-			if !sessionAssumed {
-				fast = true
+			fails, fast, backoffIdx = 0, false, -1
+			downLogged, quietLogged, sessionAssumed = false, false, false
+			nextLogin, outageSince = time.Time{}, time.Time{}
+			time.Sleep(intervalOnline)
+			continue
+		}
+
+		fails++
+		if outageSince.IsZero() {
+			outageSince = time.Now()
+		}
+
+		// 长时断网静默：探测放慢、登录尝试固定低频，直到网络真的能出去为止。
+		// 不按日历判断，因此假期里网络正常时不会进入静默，假期里真断网也能按常规节奏快速恢复。
+		if time.Since(outageSince) >= quietAfter {
+			if !quietLogged {
+				quietLogged = true
+				fmt.Printf("🌙 已连续断网 %.0f 分钟，进入静默（探测 %.0f 秒、每 %.0f 分钟尝试一次登录）\n",
+					quietAfter.Minutes(), quietProbeInterval.Seconds(), quietLoginInterval.Minutes())
 			}
-			// 只有"连续失败达到阈值"且"到了本次允许尝试的时间点"才重连：
-			// 前者挡掉单次抖动，后者挡掉冷却期内的重复请求。
-			if fails >= failThreshold && time.Now().After(nextLogin) {
-				if !downLogged {
-					downLogged = true
-					downSince = time.Now()
-					fmt.Printf("⚠️ 连续 %d 次探测失败，判定断网，开始重连\n", fails)
-				}
+			if time.Now().After(nextLogin) {
 				o := login(loginCfg, ipAddr, macAddr)
-				switch {
-				case o.success:
-					// 认证成功：进入冷却期，避免探测端点异常时反复登录
-					fmt.Printf("✅ %s\n", o.desc())
-					fails, backoffIdx = 0, -1
-					downLogged, downSince = false, time.Time{}
-					sessionAssumed, fast = true, false
-					nextLogin = time.Now().Add(loginCooldown)
-				case o.alreadyUp:
-					// 该 IP 已有会话：探测失败更可能来自探测端点本身，放慢节奏
-					fmt.Printf("ℹ️ %s，%s 后才会再次尝试登录，期间继续探测\n", o.desc(), sessionRecheck)
-					sessionAssumed, fast = true, false
-					nextLogin = time.Now().Add(sessionRecheck)
-				default:
-					backoffIdx = nextBackoffIdx(backoffIdx)
-					d := jitter(loginBackoff[backoffIdx])
-					nextLogin = time.Now().Add(d)
-					fmt.Printf("⚠️ %s，%s 后重试\n", o.desc(), d.Round(time.Second))
-				}
+				fmt.Printf("· 静默期登录尝试：%s\n", o.desc())
+				nextLogin = time.Now().Add(quietLoginInterval)
+			}
+			// 睡到"下次探测"与"下次登录尝试"中较早的一个，避免尝试时刻被探测周期推后
+			wait := quietProbeInterval
+			if d := time.Until(nextLogin); d < wait {
+				wait = d
+			}
+			time.Sleep(wait)
+			continue
+		}
+
+		// 会话已确认时探测失败更可能来自探测端点本身，保持在线档间隔，避免高频空探
+		if !sessionAssumed {
+			fast = true
+		}
+		// 只有"连续失败达到阈值"且"到了本次允许尝试的时间点"才重连：
+		// 前者挡掉单次抖动，后者挡掉冷却期内的重复请求。
+		if fails >= failThreshold && time.Now().After(nextLogin) {
+			if !downLogged {
+				downLogged = true
+				fmt.Printf("⚠️ 连续 %d 次探测失败，判定断网，开始重连\n", fails)
+			}
+			o := login(loginCfg, ipAddr, macAddr)
+			switch {
+			case o.success:
+				// 认证成功：进入冷却期，避免探测端点异常时反复登录
+				fmt.Printf("✅ %s\n", o.desc())
+				fails, backoffIdx = 0, -1
+				sessionAssumed, fast = true, false
+				nextLogin = time.Now().Add(loginCooldown)
+			case o.alreadyUp:
+				// 该 IP 已有会话：探测失败更可能来自探测端点本身，放慢节奏
+				fmt.Printf("ℹ️ %s，%s 后才会再次尝试登录，期间继续探测\n", o.desc(), sessionRecheck)
+				sessionAssumed, fast = true, false
+				nextLogin = time.Now().Add(sessionRecheck)
+			default:
+				backoffIdx = nextBackoffIdx(backoffIdx)
+				d := jitter(loginBackoff[backoffIdx])
+				nextLogin = time.Now().Add(d)
+				fmt.Printf("⚠️ %s，%s 后重试\n", o.desc(), d.Round(time.Second))
 			}
 		}
 
