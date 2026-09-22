@@ -66,13 +66,13 @@ type ui struct {
 	adapters      []netauth.Adapter
 
 	// 运行状态
-	stateVal  *walk.TextLabel
-	detailVal *walk.TextLabel
-	ipVal     *walk.TextLabel
-	macVal    *walk.TextLabel
-	routerVal *walk.TextLabel
-	loginVal  *walk.TextLabel
-	statsVal  *walk.TextLabel
+	stateVal  *walk.Label
+	detailVal *walk.Label
+	ipVal     *walk.Label
+	macVal    *walk.Label
+	routerVal *walk.Label
+	loginVal  *walk.Label
+	statsVal  *walk.Label
 
 	// 日志
 	levelCombo  *walk.ComboBox
@@ -100,6 +100,9 @@ func hboxRow(parent walk.Container) (*walk.Composite, error) {
 	return c, nil
 }
 
+// rowLabelWidth 是"标签 + 值"一行里标签列的固定宽度（1/96 英寸单位）
+const rowLabelWidth = 68
+
 // labeledRow 建一行"定宽标签 + 后续控件"，返回值那行容器，调用方往里加控件
 func labeledRow(parent walk.Container, text string, width int) (*walk.Composite, error) {
 	r, err := hboxRow(parent)
@@ -111,22 +114,41 @@ func labeledRow(parent walk.Container, text string, width int) (*walk.Composite,
 		return nil, err
 	}
 	lbl.SetText(text)
-	lbl.SetMinMaxSize(walk.Size{Width: width, Height: 20}, walk.Size{})
+	// 最大宽度也设成同一个值。walk 只把"非左对齐"的静态文本当作可伸展，
+	// 但只要一行里还剩下宽度，它就会把标签一起撑开，把值挤到行中间去，
+	// 各行的值也就对不齐了。
+	lbl.SetMinMaxSize(walk.Size{Width: width, Height: 20}, walk.Size{Width: width})
 	return r, nil
 }
 
-// valueLabel 建一个用来显示状态值的标签（只读、可选中复制）
-func valueLabel(parent walk.Container) (*walk.TextLabel, error) {
-	return walk.NewTextLabel(parent)
+// valueLabel 建一个显示状态值的标签：靠左对齐，过长时截成省略号（悬停看全文）
+func valueLabel(parent walk.Container) (*walk.Label, error) {
+	lbl, err := walk.NewLabel(parent)
+	if err != nil {
+		return nil, err
+	}
+	// 带省略号模式的 Label 才会收缩，窗口窄了不会把整行的最小宽度顶大
+	if err := lbl.SetEllipsisMode(walk.EllipsisEnd); err != nil {
+		return nil, err
+	}
+	return lbl, nil
 }
 
-// statusRow 建一行"标签 + 值"，返回值标签
-func statusRow(parent walk.Container, label string, width int) (*walk.TextLabel, error) {
+// statusRow 建一行"标签 + 值"。值后面补一个占位控件吃掉剩余宽度，
+// 值才会紧贴标签左侧，而不是被 walk 按剩余宽度推到行中间。
+func statusRow(parent walk.Container, label string, width int) (*walk.Label, error) {
 	r, err := labeledRow(parent, label, width)
 	if err != nil {
 		return nil, err
 	}
-	return valueLabel(r)
+	val, err := valueLabel(r)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := walk.NewHSpacer(r); err != nil {
+		return nil, err
+	}
+	return val, nil
 }
 
 func newGroup(parent walk.Container, title string) (*walk.GroupBox, error) {
@@ -250,21 +272,21 @@ func (u *ui) buildBasic() error {
 		return err
 	}
 
-	if r, err := labeledRow(gb, "账号", 60); err != nil {
+	if r, err := labeledRow(gb, "账号", rowLabelWidth); err != nil {
 		return err
 	} else if u.userEdit, err = walk.NewLineEdit(r); err != nil {
 		return err
 	}
 	u.userEdit.SetCueBanner("学号 / 工号")
 
-	if r, err := labeledRow(gb, "密码", 60); err != nil {
+	if r, err := labeledRow(gb, "密码", rowLabelWidth); err != nil {
 		return err
 	} else if u.passEdit, err = walk.NewLineEdit(r); err != nil {
 		return err
 	}
 	u.passEdit.SetPasswordMode(true)
 
-	if r, err := labeledRow(gb, "运营商", 60); err != nil {
+	if r, err := labeledRow(gb, "运营商", rowLabelWidth); err != nil {
 		return err
 	} else if u.netCombo, err = walk.NewComboBox(r); err != nil {
 		return err
@@ -286,47 +308,33 @@ func (u *ui) buildStatus() error {
 		return err
 	}
 
-	if u.stateVal, err = statusRow(gb, "连接状态", 60); err != nil {
+	if u.stateVal, err = statusRow(gb, "连接状态", rowLabelWidth); err != nil {
 		return err
 	}
-	if r, err := labeledRow(gb, "详细", 60); err != nil {
-		return err
-	} else if u.detailVal, err = valueLabel(r); err != nil {
-		return err
-	}
-
-	// 认证 IP 与 MAC 放在同一行
-	r, err := hboxRow(gb)
-	if err != nil {
-		return err
-	}
-	if lbl, err := walk.NewTextLabel(r); err != nil {
+	if r, err := labeledRow(gb, "详细", rowLabelWidth); err != nil {
 		return err
 	} else {
-		lbl.SetText("认证地址")
-		lbl.SetMinMaxSize(walk.Size{Width: 60, Height: 20}, walk.Size{})
-	}
-	if u.ipVal, err = valueLabel(r); err != nil {
-		return err
-	}
-	u.ipVal.SetMinMaxSize(walk.Size{Width: 140}, walk.Size{})
-	if lbl, err := walk.NewTextLabel(r); err != nil {
-		return err
-	} else {
-		lbl.SetText("认证 MAC")
-		lbl.SetMinMaxSize(walk.Size{Width: 60, Height: 20}, walk.Size{})
-	}
-	if u.macVal, err = valueLabel(r); err != nil {
-		return err
+		if u.detailVal, err = valueLabel(r); err != nil {
+			return err
+		}
+		if _, err := walk.NewHSpacer(r); err != nil {
+			return err
+		}
 	}
 
-	if u.routerVal, err = statusRow(gb, "路由器", 60); err != nil {
+	if u.ipVal, err = statusRow(gb, "认证地址", rowLabelWidth); err != nil {
 		return err
 	}
-	if u.loginVal, err = statusRow(gb, "最近认证", 60); err != nil {
+	if u.macVal, err = statusRow(gb, "认证 MAC", rowLabelWidth); err != nil {
 		return err
 	}
-	if u.statsVal, err = statusRow(gb, "运行统计", 60); err != nil {
+	if u.routerVal, err = statusRow(gb, "路由器", rowLabelWidth); err != nil {
+		return err
+	}
+	if u.loginVal, err = statusRow(gb, "最近认证", rowLabelWidth); err != nil {
+		return err
+	}
+	if u.statsVal, err = statusRow(gb, "运行统计", rowLabelWidth); err != nil {
 		return err
 	}
 
@@ -440,7 +448,7 @@ func (u *ui) buildAdvanced() error {
 	}
 	u.startHideChk.SetText("程序启动后默认不弹窗")
 
-	if r, err := labeledRow(gb, "日志目录", 60); err != nil {
+	if r, err := labeledRow(gb, "日志目录", rowLabelWidth); err != nil {
 		return err
 	} else {
 		if u.logDirEdit, err = walk.NewLineEdit(r); err != nil {
@@ -455,21 +463,21 @@ func (u *ui) buildAdvanced() error {
 		browse.Clicked().Attach(u.onBrowseLogDir)
 	}
 
-	if r, err := labeledRow(gb, "路由器 IP", 60); err != nil {
+	if r, err := labeledRow(gb, "路由器 IP", rowLabelWidth); err != nil {
 		return err
 	} else if u.routerIPEdit, err = walk.NewLineEdit(r); err != nil {
 		return err
 	}
 	u.routerIPEdit.SetCueBanner("留空 = 使用本机 IP")
 
-	if r, err := labeledRow(gb, "路由器 MAC", 60); err != nil {
+	if r, err := labeledRow(gb, "路由器 MAC", rowLabelWidth); err != nil {
 		return err
 	} else if u.routerMACEdit, err = walk.NewLineEdit(r); err != nil {
 		return err
 	}
 	u.routerMACEdit.SetCueBanner("与路由器 IP 同时填写才生效")
 
-	if r, err := labeledRow(gb, "MAC 地址", 60); err != nil {
+	if r, err := labeledRow(gb, "MAC 地址", rowLabelWidth); err != nil {
 		return err
 	} else {
 		if u.macCombo, err = walk.NewComboBox(r); err != nil {
