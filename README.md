@@ -38,7 +38,7 @@ go build -ldflags="-s -w" -o GXU_Net_AutoLogin main.go
 
 首次运行将自动生成 `.env`，编辑后重新运行即可。
 
-也可以直接用打包脚本（会注入 `git describe` 的版本号）：Linux/macOS 用 `build/build.sh`，Windows 用 `build\build.bat`（同时产出托盘版，产物都落在 `build\`）。
+多平台发布用 [GoReleaser](https://goreleaser.com)（`.goreleaser.yaml`）：`goreleaser release --snapshot --clean` 本地出全部平台产物到 `dist/`；push `v*` tag 时 `.github/workflows/release.yml` 自动构建并发 Release（资产带版本号）。
 
 ---
 
@@ -114,10 +114,10 @@ START_MINIMIZED=true     # 启动后不弹窗
 ### 打包与运行
 
 ```bat
-build\build.bat
+cd tray && go build -ldflags="-s -w -H=windowsgui" -o GXU_Net_AutoLogin_Tray.exe .
 ```
 
-产物在 `build\` 下：
+发布版用 GoReleaser 出 `GXU_Net_AutoLogin_<版本>_windows_amd64.zip`（`dist/`），zip 里同时带命令行版与托盘版两个 exe：
 
 | 文件 | 说明 |
 |---|---|
@@ -127,8 +127,6 @@ build\build.bat
 把 `GXU_Net_AutoLogin_Tray.exe` 放到想长期存放的目录，双击即可。首次运行会弹出主界面让你填账号密码；之后按「启动后不弹窗」的设置静默驻留托盘。
 
 > 💡 **配置目录**：优先用**启动时的工作目录**里的 `.env`，没有才用 exe 所在目录。
-> 所以从仓库根目录运行 `build\GXU_Net_AutoLogin_Tray.exe` 时，用的是仓库里那份 `.env`；
-> 开机自启（工作目录是 `C:\Windows\System32`）时用的是 exe 所在目录。
 
 ### 界面
 
@@ -224,8 +222,8 @@ internal/logging        日志：控制台 / 轮转文件 / 内存环形缓冲
 internal/netauth        探测、登录、认证身份（IP/MAC）解析
 internal/daemon         探测循环与状态机（可取消、可查询状态）
 tray/                   托盘版（独立 Go module，只依赖 lxn/walk）
-build/build.bat         打包 Windows 两个产物到 build\
-build/build.sh          打包命令行版（Linux / macOS）
+.goreleaser.yaml        GoReleaser 配置：多平台矩阵 + Windows 合并 zip
+.github/workflows/      push v* tag 时自动构建并发布 Release
 ```
 
 命令行版与托盘版共用 `internal/` 下的核心逻辑和同一份 `.env`；托盘版是**独立的 Go module**（`tray/go.mod`），因此命令行版依旧零第三方依赖，Linux / 命令行版那条编译路径不受影响。
