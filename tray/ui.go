@@ -330,6 +330,7 @@ func newUI(a *app) (*ui, error) {
 		if u.minToTrayChk.Checked() {
 			*canceled = true
 			mw.Hide()
+			// 进托盘也要提醒一次：窗口刚消失，用户需要知道程序还在跑
 			a.balloon(appTitle, "程序仍在后台运行，左键点托盘图标可以重新打开。")
 			return
 		}
@@ -534,7 +535,7 @@ func (u *ui) buildAdvanced() error {
 	if u.startHideChk, err = walk.NewCheckBox(gb); err != nil {
 		return err
 	}
-	u.startHideChk.SetText("程序启动后默认不弹窗")
+	u.startHideChk.SetText("启动后不显示主界面（驻留托盘）")
 	u.leftAlign(u.startHideChk)
 
 	if r, err := labeledRow(gb, "日志目录", rowLabelWidth); err != nil {

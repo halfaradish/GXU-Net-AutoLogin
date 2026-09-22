@@ -136,7 +136,8 @@ type Status struct {
 	Quiet bool // 当前是否处于静默期
 }
 
-// EventKind 是状态切换事件的类别，托盘用它决定弹不弹气泡
+// EventKind 是状态切换事件的类别。托盘版现在不订阅事件（提醒只留启动与进托盘两处），
+// 这个扩展点保留给需要感知状态切换的上层，见 docs/tray.md 的"通知策略"。
 type EventKind int
 
 const (

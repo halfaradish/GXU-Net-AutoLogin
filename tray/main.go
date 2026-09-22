@@ -6,8 +6,10 @@
 //   - 常驻托盘，双击/左键点图标打开主界面
 //   - 账号密码、运营商在界面里填一次即可
 //   - 改完"保存并应用"立刻生效并发起认证，不用重启程序
-//   - 高级选项默认收起：开机自启、关闭窗口最小化到托盘、启动不弹窗、
+//   - 高级选项默认收起：开机自启、关闭窗口最小化到托盘、启动不显示主界面、
 //     日志目录、路由器模式、自定义 MAC
+//   - 提醒只在两处：静默启动驻留托盘时、关闭窗口进托盘时各弹一次气泡。
+//     断线/恢复/静默这类状态变化不弹窗，只写日志、更新界面状态与托盘悬停提示
 //
 // 线程模型：walk 的窗口与消息循环独占主线程（runtime.LockOSThread），
 // 托盘图标挂在同一个窗口上，守护进程跑在自己的 goroutine 里。
@@ -55,7 +57,7 @@ func main() {
 	// walk 的窗口与消息循环必须在同一条 OS 线程上
 	runtime.LockOSThread()
 
-	show := flag.Bool("show", false, "启动后直接显示主界面（忽略“启动后不弹窗”）")
+	show := flag.Bool("show", false, "启动后直接显示主界面（忽略“启动后不显示主界面”）")
 	quitOther := flag.Bool("quit", false, "让正在运行的实例退出")
 	flag.Parse()
 
@@ -150,7 +152,7 @@ func newApp() (*app, error) {
 	a.hidden = hw
 
 	// 先建守护进程（此时不启动），界面上"立即重连"等按钮直接引用它
-	a.daemon = daemon.New(a.log, cfg, daemon.WithEventHandler(a.onDaemonEvent))
+	a.daemon = daemon.New(a.log, cfg)
 
 	// 主界面（同时承载消息循环与托盘图标）
 	ui, err := newUI(a)
@@ -245,11 +247,22 @@ func (a *app) run(show bool) {
 		go a.refreshLoop()
 	})
 
-	if show || a.firstRun() || !a.cfg.StartMinimized {
+	if a.backgroundStart(show) {
+		// 静默驻留托盘：主界面不显示，弹一次气泡说明程序已经在跑。
+		// 这里还在 UI 线程上、消息循环尚未开始，但托盘图标已经 SetVisible(true)，
+		// 所以 Shell_NotifyIcon 直接可用（见 walk.NotifyIcon.ShowInfo）。
+		a.balloon(appTitle, "已在后台运行，左键点托盘图标可打开主界面。")
+	} else {
 		a.ui.showWindow()
 	}
 
 	a.ui.mw.Run() // 阻塞到窗口被真正关闭（最小化到托盘不会走到这里）
+}
+
+// backgroundStart 判断这次启动是"静默驻留托盘"（主界面不显示）。
+// 首次运行（还没配置/配置读不动）和 -show 都必须把界面摆出来让用户看见。
+func (a *app) backgroundStart(show bool) bool {
+	return !show && !a.firstRun() && a.cfg.StartMinimized
 }
 
 // refreshLoop 每秒刷新一次界面与托盘提示
@@ -324,27 +337,6 @@ func (a *app) onHiddenMessage(msg uint32) {
 	}
 }
 
-// onDaemonEvent 把状态切换弹成气泡提示。这个回调来自守护进程的 goroutine，
-// 所以走 Synchronize 排到 UI 线程，避免和界面同时操作同一个 NotifyIcon。
-func (a *app) onDaemonEvent(ev daemon.Event) {
-	if a.isQuitting() {
-		return
-	}
-	a.ui.mw.Synchronize(func() {
-		if a.ni == nil {
-			return
-		}
-		switch ev.Kind {
-		case daemon.EventDown:
-			a.ni.ShowWarning("校园网已断线", ev.Text+"，正在自动重连…")
-		case daemon.EventRecovered:
-			a.ni.ShowInfo("校园网已恢复", ev.Text)
-		case daemon.EventQuiet:
-			a.ni.ShowInfo("进入静默期", ev.Text+"，之后每 5 分钟尝试一次登录")
-		}
-	})
-}
-
 // quit 真正退出程序（关闭窗口不算，除非用户取消勾选了"最小化至托盘"）
 func (a *app) quit() {
 	a.setQuitting(true)
@@ -365,10 +357,15 @@ func (a *app) setToolTip(tip string) {
 	}
 }
 
-// balloon 弹一个信息气泡（要在 UI 线程上调用）
+// balloon 弹一个信息气泡（要在 UI 线程上调用）。
+// 启动那一次气泡是"程序已经在后台跑"的唯一反馈，被系统丢掉时（专注助手、
+// 资源管理器没就绪）日志里要留痕，否则用户只看到什么都没发生。
 func (a *app) balloon(title, text string) {
-	if a.ni != nil {
-		a.ni.ShowInfo(title, text)
+	if a.ni == nil {
+		return
+	}
+	if err := a.ni.ShowInfo(title, text); err != nil {
+		a.log.Warn("气泡提示失败：%v", err)
 	}
 }
 

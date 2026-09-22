@@ -44,7 +44,7 @@ type Config struct {
 	// ── 以下仅托盘版使用，命令行版读取但不做处理 ──
 	Autostart      bool // 开机自启动
 	MinimizeToTray bool // 关闭窗口时最小化至托盘
-	StartMinimized bool // 启动后不弹窗
+	StartMinimized bool // 启动后不显示主界面（驻留托盘）
 }
 
 // Defaults 返回高级选项的初始默认值（不含账号密码）
@@ -276,7 +276,7 @@ func Render(cfg *Config) string {
 	fmt.Fprintf(&b, "AUTOSTART=%t\n", cfg.Autostart)
 	b.WriteString("# 关闭窗口时最小化至托盘：（false = 直接退出程序）\n")
 	fmt.Fprintf(&b, "MINIMIZE_TO_TRAY=%t\n", cfg.MinimizeToTray)
-	b.WriteString("# 启动后不弹窗：（true = 静默驻留托盘；还没填账号时无论如何都会弹窗）\n")
+	b.WriteString("# 启动后不显示主界面：（true = 静默驻留托盘，启动时弹一次气泡；还没填账号时无论如何都会显示主界面）\n")
 	fmt.Fprintf(&b, "START_MINIMIZED=%t\n", cfg.StartMinimized)
 
 	return b.String()
