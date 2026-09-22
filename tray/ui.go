@@ -47,6 +47,10 @@ type ui struct {
 	app *app
 	mw  *walk.MainWindow
 
+	// 内容区（除了底部按钮行都在里面）。窗口的高度由它兜底：内容放不下就出
+	// 滚动条，而不是把窗口顶大 —— 见 newUI 里的说明。
+	scroll *walk.ScrollView
+
 	// 基础配置
 	userEdit *walk.LineEdit
 	passEdit *walk.LineEdit
@@ -211,6 +215,52 @@ func logDirOf(baseDir, logFile string) string {
 
 // ── 构建界面 ──────────────────────────────────────────────
 
+// 窗口尺寸（1/96 英寸单位）。高度这里写得比内容需要的大一点，实际会被显示器
+// 工作区夹紧：屏幕够高就一次看全，不够高就出滚动条。
+const (
+	minWindowWidth  = 620 // 再窄内容就挤不下了（日志那行的过滤控件决定的）
+	minWindowHeight = 420 // 故意留小：小屏也得能拖到装得下
+	windowMargin    = 12  // 离屏幕边缘留一点，别贴着任务栏
+
+	defaultWindowWidth  = 760
+	defaultWindowHeight = 900 // 内容全放得下约需 800（本机 175% 缩放实测）
+)
+
+// applyStartupBounds 把窗口摆进当前显示器的工作区并居中。
+//
+// 不能只靠 SetSize：屏幕逻辑高度可能比内容还矮（本机 2560x1600 @175%，可用高度
+// 只有 ~866 逻辑px），那样子窗口底部会被顶出屏幕，按钮点不到。
+func (u *ui) applyStartupBounds() {
+	wa, err := workArea(u.mw.Handle())
+	if err != nil {
+		u.app.log.Warn("%v", err)
+		return
+	}
+
+	margin := u.mw.IntFrom96DPI(windowMargin)
+	availW := int(wa.Right-wa.Left) - 2*margin
+	availH := int(wa.Bottom-wa.Top) - 2*margin
+
+	size := u.mw.SizeFrom96DPI(walk.Size{Width: defaultWindowWidth, Height: defaultWindowHeight})
+	w, h := size.Width, size.Height
+	if w > availW {
+		w = availW
+	}
+	if h > availH {
+		h = availH
+	}
+
+	bounds := walk.Rectangle{
+		X:      int(wa.Left) + (int(wa.Right-wa.Left)-w)/2,
+		Y:      int(wa.Top) + (int(wa.Bottom-wa.Top)-h)/2,
+		Width:  w,
+		Height: h,
+	}
+	if err := u.mw.SetBoundsPixels(bounds); err != nil {
+		u.app.log.Warn("设置窗口位置失败：%v", err)
+	}
+}
+
 func newUI(a *app) (*ui, error) {
 	mw, err := walk.NewMainWindow()
 	if err != nil {
@@ -230,8 +280,23 @@ func newUI(a *app) (*ui, error) {
 	if err := mw.SetLayout(walk.NewVBoxLayout()); err != nil {
 		return nil, err
 	}
-	mw.SetMinMaxSize(walk.Size{Width: 620, Height: 560}, walk.Size{})
-	mw.SetSize(walk.Size{Width: 760, Height: 660})
+	mw.SetMinMaxSize(walk.Size{Width: minWindowWidth, Height: minWindowHeight}, walk.Size{})
+
+	// 内容区放进可滚动的 ScrollView，只有底部按钮行留在窗口上。
+	//
+	// 这一步是为了窗口的下限：walk 用 max(内容布局的最小尺寸, 上面声明的最小尺寸)
+	// 当窗口的最小可拖拽尺寸，而内容累加起来能到 800 逻辑px 以上（高级选项展开时
+	// 1100+）。在高缩放的小屏上（本机 2560x1600 @175%，逻辑可用高度只有 ~866px）
+	// 就会：窗口拖不小、底部按钮被顶到屏幕外、最大化时标题栏被顶到屏幕上方之外。
+	// ScrollView 的最小高度是 0（walk/scrollview.go），窗口的下限从此只由声明值
+	// 决定；内容装得下时滚动条不出现，看上去和以前一样。
+	if u.scroll, err = walk.NewScrollView(mw); err != nil {
+		return nil, err
+	}
+	u.scroll.SetScrollbars(false, true) // 横向仍按内容最小宽度，不加横向滚动条
+	if err := u.scroll.SetLayout(walk.NewVBoxLayout()); err != nil {
+		return nil, err
+	}
 
 	if err := u.buildBasic(); err != nil {
 		return nil, err
@@ -251,9 +316,11 @@ func newUI(a *app) (*ui, error) {
 	}
 
 	// 日志区吸收多余高度
-	if bl, ok := mw.Layout().(*walk.BoxLayout); ok {
+	if bl, ok := u.scroll.Layout().(*walk.BoxLayout); ok {
 		bl.SetStretchFactor(logGroup, 1)
 	}
+
+	u.applyStartupBounds()
 
 	// 关闭窗口：按界面上的勾选决定"最小化到托盘"还是"退出"
 	mw.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
@@ -282,7 +349,7 @@ func newUI(a *app) (*ui, error) {
 }
 
 func (u *ui) buildBasic() error {
-	gb, err := newGroup(u.mw, "校园网账号")
+	gb, err := newGroup(u.scroll, "校园网账号")
 	if err != nil {
 		return err
 	}
@@ -318,7 +385,7 @@ func (u *ui) buildBasic() error {
 }
 
 func (u *ui) buildStatus() error {
-	gb, err := newGroup(u.mw, "运行状态")
+	gb, err := newGroup(u.scroll, "运行状态")
 	if err != nil {
 		return err
 	}
@@ -357,7 +424,7 @@ func (u *ui) buildStatus() error {
 }
 
 func (u *ui) buildLog() (*walk.GroupBox, error) {
-	gb, err := newGroup(u.mw, "日志")
+	gb, err := newGroup(u.scroll, "日志")
 	if err != nil {
 		return nil, err
 	}
@@ -423,7 +490,9 @@ func (u *ui) buildLog() (*walk.GroupBox, error) {
 		return nil, err
 	}
 	u.logView.SetReadOnly(true)
-	u.logView.SetMinMaxSize(walk.Size{Width: 400, Height: 160}, walk.Size{})
+	// 最小高度压到 100：日志区是内容里最"软"的一块，它小一点，整份内容在高缩放
+	// 的小屏上（本机 175% 缩放，可用高度只有 ~866 逻辑px）才不用滚动就能看全
+	u.logView.SetMinMaxSize(walk.Size{Width: 400, Height: 100}, walk.Size{})
 
 	u.levelCombo.CurrentIndexChanged().Attach(u.renderAllLog)
 	u.filterEdit.EditingFinished().Attach(u.renderAllLog)
@@ -435,7 +504,7 @@ func (u *ui) buildAdvanced() error {
 	// 高级选项整块放在一个 Composite 里，默认收起（首次运行就是收起的；
 	// 之后的开合状态由 setAdvanced 记在注册表里）。walk 的布局会跳过不可见控件，
 	// 所以展开/收起只影响布局，不用改窗口大小。
-	box, err := walk.NewComposite(u.mw)
+	box, err := walk.NewComposite(u.scroll)
 	if err != nil {
 		return err
 	}

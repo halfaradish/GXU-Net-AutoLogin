@@ -168,6 +168,19 @@ func messageBox(title, text string, flags uint32) int {
 	return int(win.MessageBox(0, utf16(text), utf16(title), flags))
 }
 
+// workArea 是窗口当前所在显示器的工作区（物理像素，已扣掉任务栏）。
+// 窗口尺寸要按它夹紧：高分屏（比如 2560x1600 @175%）上逻辑可用高度比想象中
+// 小得多，不夹紧的话窗口会顶出屏幕，底部按钮点不到、最大化时标题栏还会被顶到
+// 屏幕上方之外。
+func workArea(hwnd win.HWND) (win.RECT, error) {
+	var mi win.MONITORINFO
+	mi.CbSize = uint32(unsafe.Sizeof(mi))
+	if !win.GetMonitorInfo(win.MonitorFromWindow(hwnd, win.MONITOR_DEFAULTTONEAREST), &mi) {
+		return win.RECT{}, fmt.Errorf("取显示器工作区失败：%v", windows.GetLastError())
+	}
+	return mi.RcWork, nil
+}
+
 // appIcon 取程序图标：打包时 rsrc 会把 .ico 嵌进 exe，这里把它抠出来；
 // 没嵌图标就退回系统默认图标，保证界面上一定有东西。
 func appIcon(exePath string) *walk.Icon {
