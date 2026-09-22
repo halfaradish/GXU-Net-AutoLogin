@@ -97,6 +97,11 @@ func hboxRow(parent walk.Container) (*walk.Composite, error) {
 	if err := c.SetLayout(walk.NewHBoxLayout()); err != nil {
 		return nil, err
 	}
+	// 只去掉左右外边距：这样行里的标签与分组里直接摆放的控件（比如高级选项的
+	// 复选框）从同一条竖线开始；上下留着，行的疏密才不至于挤在一起。
+	if err := c.Layout().SetMargins(walk.Margins{HNear: 0, VNear: 9, HFar: 0, VFar: 9}); err != nil {
+		return nil, err
+	}
 	return c, nil
 }
 
@@ -263,6 +268,14 @@ func newUI(a *app) (*ui, error) {
 	})
 
 	u.loadFromConfig(a.cfg)
+
+	// 高级选项沿用上次的开合状态；首次运行（没有记录）保持收起
+	if expanded, err := loadAdvancedShown(); err != nil {
+		a.log.Warn("读取界面状态失败：%v", err)
+	} else if expanded {
+		u.setAdvanced(true)
+	}
+
 	return u, nil
 }
 
@@ -417,8 +430,9 @@ func (u *ui) buildLog() (*walk.GroupBox, error) {
 }
 
 func (u *ui) buildAdvanced() error {
-	// 高级选项整块放在一个 Composite 里，默认不可见；walk 的布局会跳过不可见控件，
-	// 所以展开/收起只影响布局，不用改窗口大小
+	// 高级选项整块放在一个 Composite 里，默认收起（首次运行就是收起的；
+	// 之后的开合状态由 setAdvanced 记在注册表里）。walk 的布局会跳过不可见控件，
+	// 所以展开/收起只影响布局，不用改窗口大小。
 	box, err := walk.NewComposite(u.mw)
 	if err != nil {
 		return err
@@ -426,6 +440,7 @@ func (u *ui) buildAdvanced() error {
 	if err := box.SetLayout(walk.NewVBoxLayout()); err != nil {
 		return err
 	}
+	box.SetVisible(false)
 	u.advanced = box
 
 	gb, err := newGroup(box, "高级选项")
@@ -437,16 +452,19 @@ func (u *ui) buildAdvanced() error {
 		return err
 	}
 	u.autostartChk.SetText("开机自启动（写入当前用户的启动项）")
+	u.leftAlign(u.autostartChk)
 
 	if u.minToTrayChk, err = walk.NewCheckBox(gb); err != nil {
 		return err
 	}
 	u.minToTrayChk.SetText("关闭窗口时最小化至托盘")
+	u.leftAlign(u.minToTrayChk)
 
 	if u.startHideChk, err = walk.NewCheckBox(gb); err != nil {
 		return err
 	}
 	u.startHideChk.SetText("程序启动后默认不弹窗")
+	u.leftAlign(u.startHideChk)
 
 	if r, err := labeledRow(gb, "日志目录", rowLabelWidth); err != nil {
 		return err
@@ -659,12 +677,28 @@ func (u *ui) collect() (*config.Config, error) {
 // ── 事件处理 ──────────────────────────────────────────────
 
 func (u *ui) toggleAdvanced() {
-	show := !u.advanced.Visible()
+	u.setAdvanced(!u.advanced.Visible())
+}
+
+// setAdvanced 展开/收起高级选项，并把状态记下来（下次启动沿用）
+func (u *ui) setAdvanced(show bool) {
 	u.advanced.SetVisible(show)
 	if show {
 		u.advBtn.SetText("高级选项 ▴")
 	} else {
 		u.advBtn.SetText("高级选项 ▾")
+	}
+
+	if err := saveAdvancedShown(show); err != nil {
+		u.app.log.Warn("记住界面状态失败：%v", err)
+	}
+}
+
+// leftAlign 把控件靠左对齐。walk 的纵向布局对"默认对齐"的控件会在水平方向居中，
+// 而按钮类型（复选框就是）的 init 并不设置对齐，于是复选框会跑到中间去。
+func (u *ui) leftAlign(w walk.Widget) {
+	if err := w.SetAlignment(walk.AlignHNearVCenter); err != nil {
+		u.app.log.Warn("设置控件对齐失败：%v", err)
 	}
 }
 

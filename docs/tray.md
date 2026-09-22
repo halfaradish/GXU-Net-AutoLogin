@@ -62,6 +62,14 @@ cd tray && rsrc -arch amd64 -manifest tray.exe.manifest -ico assets/icon.ico -o 
 
 一个刻意的设计：**登录的成败不改写连接状态**。连接状态只由探测决定（门户说"认证成功"而探测仍失败的情况确实存在，重试期间用 `StateAuthing` 表示正在认证）。2026-09 的单元测试就是因为最初的实现把状态判错了才补上的。
 
+## 界面状态存哪
+
+高级选项的开合状态记在注册表 `HKCU\Software\GXU-Net-AutoLogin` 的 `AdvancedShown`（字符串 `"0"`/`"1"`），切换时立即写入。首次运行没有这个值 → 默认收起。
+
+- **不写进 `.env`**：`.env` 是与命令行版共用的配置文件，「恢复默认配置」也不该把窗口开合一起重置；放注册表也与开机自启项的风格一致。
+- 值名与字符串形式沿用同机上已有的写法（注册表里还看到 `CloseToTray`、`PlainSymbols`、`AutoScroll`、`StartMinimized`，来自另一份实现），读取时**同时兼容 DWORD**，免得被写成数字类型就读不出来。
+- 注册表相关的用例（`tray/win_test.go`）默认跳过，用 `GXU_TEST_REGISTRY=1` 才跑；它们会先存下原值、跑完还原，不会动用户正在用的设置。
+
 ## 已知限制
 
 - 托盘版只在 Windows 编译；`tray/main_other.go` 是给其它平台的桩，让 `go build ./...` 不至于报错。
