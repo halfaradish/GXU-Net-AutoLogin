@@ -222,7 +222,9 @@ func newUI(a *app) (*ui, error) {
 	if err := mw.SetTitle(appTitle); err != nil {
 		return nil, err
 	}
-	if err := mw.SetIcon(walk.IconApplication()); err != nil {
+	// 与托盘共用同一个从 exe 抠出来的图标：SetIcon 发的是 WM_SETICON，
+	// 它压过 exe 自带的图标资源，任务栏、Alt+Tab 与标题栏都看这个
+	if err := mw.SetIcon(a.icon); err != nil {
 		a.log.Warn("设置窗口图标失败：%v", err)
 	}
 	if err := mw.SetLayout(walk.NewVBoxLayout()); err != nil {

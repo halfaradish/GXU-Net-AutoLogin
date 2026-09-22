@@ -56,6 +56,8 @@ go run ./tools/genicon
 cd tray && rsrc -arch amd64 -manifest tray.exe.manifest -ico assets/icon.ico -o rsrc.syso
 ```
 
+托盘图标与主界面窗口图标是**同一个** `walk.Icon`（`appIcon(exe)` 从 exe 抠出来的，见 `tray/win.go`）：托盘走 `NotifyIcon.SetIcon`，窗口走 `ui.go` 里的 `mw.SetIcon(a.icon)`。窗口图标别写成 `walk.IconApplication()`——那是系统自带的通用图标，`WM_SETICON` 会压过 exe 的图标资源，任务栏和 Alt+Tab 就变回默认样子了。尺寸由 walk 的 `FormBase.SetIcon` 按 DPI 从源图标派生（16px 给标题栏、32px 给任务栏），所以 `appIcon` 按 32 取即可。
+
 ## 核心逻辑的可测性
 
 `internal/daemon` 把探测、登录、认证身份解析都做成了可注入的函数（`WithProber`/`WithAuthenticator`/`WithIdentityResolver`/`WithTiming`），因此状态机可以在毫秒级跑完整场景：断网判定、退避重试、静默进入与退出、恢复统计、保存并应用后立即认证。见 `internal/daemon/daemon_test.go`。
