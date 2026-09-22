@@ -1,0 +1,73 @@
+version: 2
+project_name: GXU_Net_AutoLogin
+env:
+  - CGO_ENABLED=0
+
+builds:
+  # CLI：现代平台（unix amd64/arm64 + windows amd64）
+  - id: cli-modern
+    binary: GXU_Net_AutoLogin
+    main: .
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ignore:
+      - goos: windows
+        goarch: arm64
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+  # CLI：仅 windows 386（无托盘版）
+  - id: cli-386
+    binary: GXU_Net_AutoLogin
+    main: .
+    goos: [windows]
+    goarch: [386]
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+  # 托盘版：独立 module，仅 windows amd64
+  - id: tray
+    dir: tray
+    binary: GXU_Net_AutoLogin_Tray
+    main: .
+    goos: [windows]
+    goarch: [amd64]
+    ldflags:
+      - -s -w -H=windowsgui -X main.version={{ .Version }}
+
+archives:
+  # Linux/macOS：cli 裸二进制
+  - id: unix-bin
+    ids: [cli-modern]
+    formats: [binary]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats: [none]
+
+  # Windows 386：单独的裸 exe
+  - id: win-386
+    ids: [cli-386]
+    formats: [binary]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: linux
+        formats: [none]
+      - goos: darwin
+        formats: [none]
+
+  # Windows amd64：CLI + 托盘两个 exe 合并成一个 zip
+  - id: win-zip
+    ids: [cli-modern, tray]
+    formats: [zip]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: linux
+        formats: [none]
+      - goos: darwin
+        formats: [none]
+    allow_different_binary_count: true
+    files: [none*]
+
+checksum:
+  name_template: checksums.txt
