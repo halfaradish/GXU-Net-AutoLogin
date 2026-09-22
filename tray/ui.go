@@ -30,7 +30,7 @@ var netTypeOptions = []struct {
 	Label string
 	Value string
 }{
-	{"校园网（不填运营商）", ""},
+	{"校园网（默认）", ""},
 	{"电信 telecom", "telecom"},
 	{"联通 unicom", "unicom"},
 	{"移动 cmcc", "cmcc"},
