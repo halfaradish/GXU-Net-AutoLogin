@@ -85,7 +85,9 @@ const (
 	StateQuiet
 	// StateAuthing 正在发起登录
 	StateAuthing
-	// StateFailed 启动失败（例如拿不到本机 IP/MAC）
+	// StateFailed 启动失败。现在没有路径会置成它了——拿不到本机 IP/MAC 之类的
+	// 问题都改成在循环里重试（见 refreshIdentity），不再把守护判死；
+	// 保留它是为了界面上仍有对应的显示分支
 	StateFailed
 )
 
@@ -304,27 +306,21 @@ func (d *Daemon) restart(forceLogin bool) error {
 		s.Fast, s.Quiet = false, false
 		s.OutageSince = time.Time{}
 		s.ConsecutiveFails = 0
+		// 换配置后旧的认证身份不再作数（路由器模式、手动 MAC 都会改它），
+		// 循环里会重新解析
+		s.Identity = netauth.Identity{}
 	})
-
-	// 认证身份可能随配置变化（路由器模式、手动 MAC），每次都重新解析
-	id, err := d.resolve(cfg)
-	if err != nil {
-		d.mutate(func(s *Status) {
-			s.State = StateFailed
-			s.Detail = err.Error()
-		})
-		return err
-	}
 
 	if cfg.RouterIP != "" && cfg.RouterMAC != "" {
 		d.log.Info("使用路由器模式进行认证")
 	} else {
 		d.log.Info("使用本机模式进行认证")
 	}
-	d.log.Info("守护进程启动：认证IP=%s | 认证MAC=%s", id.IP, id.MAC)
 
+	// 认证身份不在这里解析：开机自启时网络可能还没就绪，解析失败一次就把守护
+	// 判死（原来就是这样，进程从此再也不重试）。解析挪进循环里跟着重试，
+	// 见 refreshIdentity / identityFor。
 	d.mutate(func(s *Status) {
-		s.Identity = id
 		s.RouterMode = cfg.RouterIP != "" && cfg.RouterMAC != ""
 		s.RouterIP, s.RouterMAC = cfg.RouterIP, cfg.RouterMAC
 	})
@@ -336,13 +332,13 @@ func (d *Daemon) restart(forceLogin bool) error {
 	d.cancel, d.done = cancel, done
 	d.mu.Unlock()
 
-	go d.run(ctx, done, cfg, id, forceLogin)
+	go d.run(ctx, done, cfg, forceLogin)
 	return nil
 }
 
 // run 是守护循环本体。结构与命令行版保持一致：
 // 连续失败才判定断网、探测间隔自适应、登录失败按退避重试、长时间断网进入静默。
-func (d *Daemon) run(ctx context.Context, done chan<- struct{}, cfg *config.Config, id netauth.Identity, forceLogin bool) {
+func (d *Daemon) run(ctx context.Context, done chan<- struct{}, cfg *config.Config, forceLogin bool) {
 	defer close(done)
 
 	t := d.timing.withDefaults()
@@ -351,14 +347,18 @@ func (d *Daemon) run(ctx context.Context, done chan<- struct{}, cfg *config.Conf
 	// "保存并应用"要求改完立刻认证一次，不等探测判定
 	if forceLogin {
 		d.log.Info("配置已应用，立即认证一次")
-		d.attemptLogin(cfg, id, st, t, false)
+		d.attemptLogin(cfg, st, t, false)
 	}
 
 	for {
+		// 还没有认证身份（开机自启时网络没就绪就是这种情况）就再试一次。
+		// 失败不影响探测：网络一恢复，这里就能拿到 IP 了。
+		d.refreshIdentity(cfg, st)
+
 		// "立即重连"：不管当前判定如何，直接认证一次
 		if d.takeForced() {
 			d.log.Info("手动触发：立即认证一次")
-			d.attemptLogin(cfg, id, st, t, false)
+			d.attemptLogin(cfg, st, t, false)
 		}
 
 		ok, fail := d.probe()
@@ -398,7 +398,7 @@ func (d *Daemon) run(ctx context.Context, done chan<- struct{}, cfg *config.Conf
 			})
 
 			if time.Now().After(st.nextLogin) {
-				d.attemptLogin(cfg, id, st, t, true)
+				d.attemptLogin(cfg, st, t, true)
 			}
 
 			// 睡到"下次探测"与"下次登录尝试"中较早的一个，避免尝试时刻被探测周期推后
@@ -426,7 +426,7 @@ func (d *Daemon) run(ctx context.Context, done chan<- struct{}, cfg *config.Conf
 				d.log.Warn("连续 %d 次探测失败，判定断网，开始重连", st.fails)
 				d.emit(Event{Kind: EventDown, Text: fmt.Sprintf("连续 %d 次探测失败，判定断网", st.fails)})
 			}
-			d.attemptLogin(cfg, id, st, t, false)
+			d.attemptLogin(cfg, st, t, false)
 		}
 
 		interval := t.IntervalOnline
@@ -450,6 +450,15 @@ type loopState struct {
 	nextLogin      time.Time
 	outageSince    time.Time
 	stat           netauth.OutageStat
+
+	// 认证身份（本机 IP/MAC）。零值表示还没解析出来——开机自启时网络可能还没就绪，
+	// 解析不出来就每轮重试，网络恢复后自然接上；解析出来后登录前还会再刷新一次，
+	// 因为换网 / DHCP 续租之后旧 IP 可能已经不对了。
+	id netauth.Identity
+
+	// 两类警告各只报一次，避免一秒一条刷屏（解析成功后重新武装）
+	resolveWarned bool
+	skipWarned    bool
 }
 
 func (st *loopState) reset() {
@@ -457,6 +466,55 @@ func (st *loopState) reset() {
 	st.downLogged, st.quietLogged, st.sessionAssumed = false, false, false
 	st.nextLogin, st.outageSince = time.Time{}, time.Time{}
 	st.stat.Reset()
+}
+
+// resolveIdentity 解析一次认证身份并记下来
+func (d *Daemon) resolveIdentity(cfg *config.Config, st *loopState) (netauth.Identity, error) {
+	id, err := d.resolve(cfg)
+	if err != nil {
+		return netauth.Identity{}, err
+	}
+
+	changed := id != st.id
+	st.id = id
+	st.resolveWarned, st.skipWarned = false, false
+
+	d.mutate(func(s *Status) { s.Identity = id })
+	if changed {
+		d.log.Info("认证身份：IP=%s | MAC=%s（%s）", id.IP, id.MAC, id.Source)
+	}
+	return id, nil
+}
+
+// identityFor 取这次认证要用的身份。refresh=true（登录前）时总是重新解析一次；
+// 平时只有手上还没有结果时才解析。解析失败时如果还有旧结果就沿用旧的——一次抖动
+// 不该把登录也跳掉；一个结果都没有才报错，由调用方决定怎么办。
+func (d *Daemon) identityFor(cfg *config.Config, st *loopState, refresh bool) (netauth.Identity, error) {
+	if !refresh && st.id != (netauth.Identity{}) {
+		return st.id, nil
+	}
+
+	id, err := d.resolveIdentity(cfg, st)
+	if err == nil {
+		return id, nil
+	}
+	if st.id != (netauth.Identity{}) {
+		d.log.Warn("重新解析认证身份失败（%v），沿用上次的 IP=%s MAC=%s", err, st.id.IP, st.id.MAC)
+		return st.id, nil
+	}
+	return netauth.Identity{}, err
+}
+
+// refreshIdentity 是循环每轮开头的"尽力解析"：还没有身份就再试一次，失败只警告
+// 一次、不打断探测——开机时网络没就绪就是这种情况，等网络起来自然就好了。
+func (d *Daemon) refreshIdentity(cfg *config.Config, st *loopState) {
+	if st.id != (netauth.Identity{}) {
+		return
+	}
+	if _, err := d.identityFor(cfg, st, false); err != nil && !st.resolveWarned {
+		st.resolveWarned = true
+		d.log.Warn("拿不到本机 IP/MAC（%v），守护继续探测，稍后自动重试", err)
+	}
 }
 
 // noteOnline 处理"这次探测成功"：只在状态切换时打印，避免刷屏
@@ -501,7 +559,19 @@ func (d *Daemon) noteFail(st *loopState, fail netauth.ProbeFailure) {
 
 // attemptLogin 发起一次登录并按结果更新状态与节奏。quiet=true 时（静默期）由
 // 调用方固定低频重试，因此这里只记录结果、不做退避。
-func (d *Daemon) attemptLogin(cfg *config.Config, id netauth.Identity, st *loopState, t Timing, quiet bool) netauth.Outcome {
+func (d *Daemon) attemptLogin(cfg *config.Config, st *loopState, t Timing, quiet bool) netauth.Outcome {
+	// 登录前重新解析一次身份：换网 / DHCP 续租之后旧 IP 可能已经不对，拿旧 IP
+	// 去认证门户会拒。解析不出来就别发这次登录——发了也是白搭，等下一轮再试。
+	id, err := d.identityFor(cfg, st, true)
+	if err != nil {
+		if !st.skipWarned {
+			st.skipWarned = true
+			d.log.Warn("拿不到本机 IP/MAC（%v），本次登录跳过，稍后重试", err)
+		}
+		d.mutate(func(s *Status) { s.Detail = "拿不到本机 IP/MAC，登录已跳过：" + err.Error() })
+		return netauth.Outcome{Err: err}
+	}
+
 	// 认证期间状态标成"认证中"，结束后还原——连接状态由探测决定，
 	// 一次登录的成败不该改写它（门户说成功、而探测仍失败的情况确实存在）
 	prev := d.Status().State

@@ -64,6 +64,27 @@ cd tray && rsrc -arch amd64 -manifest tray.exe.manifest -ico assets/icon.ico -o 
 
 一个刻意的设计：**登录的成败不改写连接状态**。连接状态只由探测决定（门户说"认证成功"而探测仍失败的情况确实存在，重试期间用 `StateAuthing` 表示正在认证）。2026-09 的单元测试就是因为最初的实现把状态判错了才补上的。
 
+## 认证身份：解析放在循环里，失败要重试
+
+认证身份（本机 IP/MAC）**不在 `restart` 里解析**，而是放在守护循环里：
+
+- 循环每轮开头 `refreshIdentity` 尽力解析一次（还没有结果时才试），失败只警告一次、
+  不打断探测。开机自启时网络还没就绪就是这样——`net.Dial("udp","8.8.8.8:80")` 报
+  `A socket operation was attempted to an unreachable host`，等网络起来自然就好了。
+- 登录前 `identityFor(refresh=true)` 再解析一次：换网 / DHCP 续租之后旧 IP 可能已经
+  不对，拿旧 IP 去认证门户会拒。解析失败但手上还有旧结果就沿用旧的，不因此跳过登录。
+- 一个结果都没有时才跳过这次登录（`本次登录跳过`）——拿空 IP 发认证没有意义。
+
+**原来的写法是这一条的反面**：`restart` 里解析一次，失败就 `StateFailed` 并 `return`，
+连 `go d.run(...)` 都不执行。于是开机时一次 unreachable 就让程序永久失效——没有循环、
+没有重试，`Trigger()`（立即重连）也只是往没人读的 channel 里塞信号。改动见
+`TestIdentityFailureRetriesUntilReady` / `TestLoginSkippedWhileIdentityUnknown` /
+`TestLoginRefreshesIdentity`。
+
+副作用：`StateFailed` 现在没有生产者了（保留常量是因为界面还有对应的显示分支），
+命令行版 `main.go` 里 `Start()` 失败就 `os.Exit(1)` 也成了防御性分支——拿不到 IP
+不再算启动失败，而是继续重试。
+
 ## 窗口尺寸：下限不能被内容决定
 
 小屏幕上（尤其高缩放，本机 2560x1600 @175% 的逻辑可用高度只有 ~866px）出过三个
@@ -80,11 +101,14 @@ cd tray && rsrc -arch amd64 -manifest tray.exe.manifest -ico assets/icon.ico -o 
   滚动区外面，内容再长也钉在底部可点。往界面上加东西时**别把控件挂回 `u.mw`**
   （`tray/ui_test.go` 的 `TestButtonsPinnedOutsideScrollArea` 会拦）。
 - **启动尺寸由 `applyStartupBounds` 按显示器工作区夹紧**（`workArea()` + 居中），不是
-  写死的 760x660：屏幕够高就一次看全，不够高就铺满可用高度、内容区自己出滚动条。
+  写死的尺寸：屏幕够高就一次看全（`defaultWindowHeight` 取够放下"收起 + 展开高级选项"
+  两种状态），不够高就铺满可用高度、内容区自己出滚动条。逻辑高度随缩放变化很大
+  （同一台机器 175% 时可用高度只有 ~866，100% 时有 ~1392），所以这些尺寸一律按
+  96DPI 单位给、由 walk 换算，判断都用工作区而不是绝对像素。
 
-`tray/ui_test.go` 里有四个用例盯着这几点（最小尺寸不超过工作区、窗口/最大化后装得下
-屏幕、标题栏没被顶出去、按钮行不在滚动区里），都是拿当前显示器的工作区比，换分辨率
-和缩放也成立。
+`tray/ui_test.go` 里有五个用例盯着这几点（最小尺寸不超过工作区、窗口/最大化后装得下
+屏幕、标题栏没被顶出去、按钮行不在滚动区里、装得下就不该要滚动），都是拿当前显示器的
+工作区比，换分辨率和缩放也成立。
 
 顺带记下两个 walk 的坑：表单的 `SetMinMaxSize` 里 **max 参数是空操作**（walk 只写
 `PtMinTrackSize`，从不写 `PtMaxTrackSize`），别指望它限制放大；`SetSize` 走的是

@@ -147,7 +147,8 @@ func main() {
 		log.Info("日志文件: %s（单文件上限 %d MiB，保留 %d 个备份）", logFilePath, log.MaxSizeMiB(), log.Backups())
 	}
 
-	// 启动守护：解析认证 IP/MAC 并进入探测循环（失败即退出，与原行为一致）
+	// 启动守护：进入探测循环。认证 IP/MAC 是在循环里解析的，拿不到（比如开机时
+	// 网络还没就绪）会一直重试，不再算启动失败——所以这里基本不会走到退出分支
 	d := daemon.New(log, cfg)
 	if err := d.Start(); err != nil {
 		log.Error("%v", err)

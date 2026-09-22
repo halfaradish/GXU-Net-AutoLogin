@@ -216,14 +216,14 @@ func logDirOf(baseDir, logFile string) string {
 // ── 构建界面 ──────────────────────────────────────────────
 
 // 窗口尺寸（1/96 英寸单位）。高度这里写得比内容需要的大一点，实际会被显示器
-// 工作区夹紧：屏幕够高就一次看全，不够高就出滚动条。
+// 工作区夹紧：屏幕够高就一次看全（高级选项展开也放得下），不够高就出滚动条。
 const (
 	minWindowWidth  = 620 // 再窄内容就挤不下了（日志那行的过滤控件决定的）
 	minWindowHeight = 420 // 故意留小：小屏也得能拖到装得下
 	windowMargin    = 12  // 离屏幕边缘留一点，别贴着任务栏
 
 	defaultWindowWidth  = 760
-	defaultWindowHeight = 900 // 内容全放得下约需 800（本机 175% 缩放实测）
+	defaultWindowHeight = 1100 // 收起 ~900、展开高级选项 ~1080（100% 缩放下实测），取够放下两者
 )
 
 // applyStartupBounds 把窗口摆进当前显示器的工作区并居中。

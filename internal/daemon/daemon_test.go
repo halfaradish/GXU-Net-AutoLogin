@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -43,6 +44,54 @@ func (p *toggleProber) probe() (bool, netauth.ProbeFailure) {
 // call 是一次登录调用的留痕
 type call struct {
 	user, password, netType, ip, mac string
+}
+
+// fakeResolver 的身份解析结果由测试随时切换：默认按配置给出固定身份，
+// 需要模拟"开机时网络还没就绪"就先让它失败
+type fakeResolver struct {
+	mu    sync.Mutex
+	calls int
+	err   error
+	ip    string
+	mac   string
+}
+
+// fail 让之后的解析都失败
+func (r *fakeResolver) fail(err error) {
+	r.mu.Lock()
+	r.err = err
+	r.mu.Unlock()
+}
+
+// ok 让之后的解析返回指定身份
+func (r *fakeResolver) ok(ip, mac string) {
+	r.mu.Lock()
+	r.err, r.ip, r.mac = nil, ip, mac
+	r.mu.Unlock()
+}
+
+func (r *fakeResolver) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
+}
+
+func (r *fakeResolver) resolve(cfg *config.Config) (netauth.Identity, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.calls++
+	if r.err != nil {
+		return netauth.Identity{}, r.err
+	}
+	if cfg.RouterIP != "" && cfg.RouterMAC != "" {
+		return netauth.Identity{IP: cfg.RouterIP, MAC: cfg.RouterMAC, Source: netauth.SourceRouter}, nil
+	}
+	ip, mac := r.ip, r.mac
+	if ip == "" {
+		ip, mac = "10.0.0.2", "aa:bb:cc:dd:ee:ff"
+	}
+	return netauth.Identity{IP: ip, MAC: mac, Source: netauth.SourceAuto}, nil
 }
 
 type fakeAuth struct {
@@ -94,19 +143,21 @@ func fastTiming() Timing {
 
 // fixture 是搭好的一套 daemon + 测试替身
 type fixture struct {
-	d      *Daemon
-	prober *toggleProber
-	auth   *fakeAuth
-	log    *logging.Logger
+	d        *Daemon
+	prober   *toggleProber
+	auth     *fakeAuth
+	resolver *fakeResolver
+	log      *logging.Logger
 }
 
 func newFixture(t *testing.T, cfg *config.Config, mutate func(*fakeAuth)) *fixture {
 	t.Helper()
 
 	f := &fixture{
-		prober: &toggleProber{},
-		auth:   &fakeAuth{},
-		log:    logging.New(logging.Options{RingLines: 500}),
+		prober:   &toggleProber{},
+		auth:     &fakeAuth{},
+		resolver: &fakeResolver{},
+		log:      logging.New(logging.Options{RingLines: 500}),
 	}
 	if mutate != nil {
 		mutate(f.auth)
@@ -117,12 +168,7 @@ func newFixture(t *testing.T, cfg *config.Config, mutate func(*fakeAuth)) *fixtu
 		WithProber(f.prober.probe),
 		WithAuthenticator(f.auth.login),
 		// 身份解析固定住，测试不依赖真实网卡
-		WithIdentityResolver(func(cfg *config.Config) (netauth.Identity, error) {
-			if cfg.RouterIP != "" && cfg.RouterMAC != "" {
-				return netauth.Identity{IP: cfg.RouterIP, MAC: cfg.RouterMAC, Source: netauth.SourceRouter}, nil
-			}
-			return netauth.Identity{IP: "10.0.0.2", MAC: "aa:bb:cc:dd:ee:ff", Source: netauth.SourceAuto}, nil
-		}),
+		WithIdentityResolver(f.resolver.resolve),
 	)
 	t.Cleanup(f.d.Stop)
 	return f
@@ -160,18 +206,120 @@ func (f *fixture) waitCalls(t *testing.T, n int) {
 	}
 }
 
-// logContains 报告日志里是否出现过某段文字
-func (f *fixture) logContains(sub string) bool {
+// logCount 数一段文字在日志里出现了几次
+func (f *fixture) logCount(sub string) int {
 	lines, _ := f.log.Snapshot()
+	n := 0
 	for _, l := range lines {
 		if strings.Contains(l.Message, sub) {
-			return true
+			n++
 		}
 	}
-	return false
+	return n
+}
+
+// logContains 报告日志里是否出现过某段文字
+func (f *fixture) logContains(sub string) bool {
+	return f.logCount(sub) > 0
 }
 
 // ── 用例 ──────────────────────────────────────────────────
+
+// 开机自启时网络还没就绪，拿不到本机 IP（unreachable）不能把守护判死：
+// 应当一直重试，网络恢复后自动接上。用户报的就是这条——原来解析只做一次，
+// 失败后连探测循环都不启动，程序从此永久失效。
+func TestIdentityFailureRetriesUntilReady(t *testing.T) {
+	f := newFixture(t, testConfig(), nil)
+	unreachable := errors.New("dial udp 8.8.8.8:80: connect: A socket operation was attempted to an unreachable host")
+	f.resolver.fail(unreachable)
+	f.prober.set(false, "网络不可达")
+
+	// 拿不到 IP 不该算启动失败：循环照常跑，否则没人能再触发解析
+	if err := f.d.Start(); err != nil {
+		t.Fatalf("拿不到本机 IP 不该算启动失败：%v", err)
+	}
+	f.waitFor(t, "判定断网", func(s Status) bool { return s.State == StateDown })
+
+	// 要一直在重试，而不是试一次就算了
+	before := f.resolver.count()
+	time.Sleep(30 * time.Millisecond)
+	if after := f.resolver.count(); after <= before {
+		t.Fatalf("身份解析没有重试：调用次数停在 %d", before)
+	}
+
+	// 失败原因只警告一次，别一秒一条刷屏
+	if n := f.logCount("守护继续探测"); n != 1 {
+		t.Errorf("解析失败的警告应当只出现一次，实际 %d 次", n)
+	}
+
+	// 网络恢复：探测正常、也能拿到 IP 了
+	f.prober.set(true, "")
+	f.resolver.ok("10.0.0.9", "aa:bb:cc:dd:ee:09")
+	st := f.waitFor(t, "在线且身份已解析", func(s Status) bool {
+		return s.State == StateOnline && s.Identity.IP == "10.0.0.9"
+	})
+	if st.Identity.MAC != "aa:bb:cc:dd:ee:09" {
+		t.Errorf("界面上的认证 MAC 没跟着更新：%+v", st.Identity)
+	}
+	if !f.logContains("认证身份") {
+		t.Error("解析成功后应当记录一行认证身份")
+	}
+}
+
+// 身份还没解析出来时不能拿空 IP 去认证：跳过这次登录、说清原因，
+// 等身份拿到了再补上
+func TestLoginSkippedWhileIdentityUnknown(t *testing.T) {
+	f := newFixture(t, testConfig(), nil)
+	f.resolver.fail(errors.New("dial udp 8.8.8.8:80: connect: A socket operation was attempted to an unreachable host"))
+	f.prober.set(false, "网络不可达")
+
+	if err := f.d.Start(); err != nil {
+		t.Fatalf("拿不到本机 IP 不该算启动失败：%v", err)
+	}
+	f.waitFor(t, "判定断网", func(s Status) bool {
+		return s.State == StateDown && s.ConsecutiveFails >= fastTiming().FailThreshold
+	})
+	time.Sleep(30 * time.Millisecond) // 跑过好几个"该登录了"的时刻
+
+	if n := f.auth.count(); n != 0 {
+		t.Fatalf("身份没解析出来还发了 %d 次登录（会拿空 IP 去认证）：%+v", n, f.auth.snapshot())
+	}
+	if !f.logContains("本次登录跳过") {
+		t.Error("跳过登录时应当在日志里说明原因")
+	}
+
+	// 身份能拿到之后，这次登录要补上，并且用解析出来的 IP
+	f.resolver.ok("10.0.0.7", "aa:bb:cc:dd:ee:07")
+	f.waitCalls(t, 1)
+	if got := f.auth.snapshot()[0].ip; got != "10.0.0.7" {
+		t.Fatalf("登录用的 IP 不对：%q", got)
+	}
+}
+
+// 登录前要重新解析身份：换网 / DHCP 续租之后旧 IP 可能已经不对了
+func TestLoginRefreshesIdentity(t *testing.T) {
+	f := newFixture(t, testConfig(), nil)
+	f.prober.set(true, "")
+
+	if err := f.d.Start(); err != nil {
+		t.Fatalf("Start 失败：%v", err)
+	}
+	f.waitFor(t, "在线且身份已解析", func(s Status) bool {
+		return s.State == StateOnline && s.Identity.IP == "10.0.0.2"
+	})
+
+	// 网络变了：本机 IP 换了一个，接着断网触发登录
+	f.resolver.ok("10.0.0.9", "aa:bb:cc:dd:ee:09")
+	f.prober.set(false, "网络不可达")
+	f.waitCalls(t, 1)
+
+	if got := f.auth.snapshot()[0].ip; got != "10.0.0.9" {
+		t.Fatalf("登录用的是旧 IP %q，登录前应当重新解析", got)
+	}
+	if st := f.d.Status(); st.Identity.IP != "10.0.0.9" {
+		t.Errorf("界面上的认证地址没跟着更新：%+v", st.Identity)
+	}
+}
 
 // 在线时不发起登录，状态稳定在"在线"
 func TestOnlineDoesNotLogin(t *testing.T) {
@@ -198,22 +346,22 @@ func TestOutageTriggersLoginThenRecovers(t *testing.T) {
 		t.Fatalf("Start 失败：%v", err)
 	}
 
-	st := f.waitFor(t, "判定断网", func(s Status) bool { return s.State == StateDown })
-	if st.ConsecutiveFails < fastTiming().FailThreshold {
-		t.Fatalf("判定断网时连续失败次数应达到阈值，实际 %+v", st)
-	}
+	f.waitFor(t, "判定断网", func(s Status) bool { return s.State == StateDown })
 	f.waitCalls(t, 1)
 
 	if c := f.auth.snapshot()[0]; c.user != "u1" || c.password != "p1" || c.ip != "10.0.0.2" {
 		t.Fatalf("登录参数不对：%+v", c)
 	}
+	// "先达到阈值、再登录"由这行日志作证：它就在阈值判定处、紧挨着登录发出。
+	// 别去采 Status().ConsecutiveFails——登录成功会把它清零，采样点落在哪一侧
+	// 全看调度，原来那个断言就是因此随机失败的
 	if !f.logContains("连续 2 次探测失败，判定断网，开始重连") {
 		t.Fatal("日志里缺少判定断网的记录")
 	}
 
 	// 网络恢复：状态回到在线，并记下一次断网
 	f.prober.set(true, "")
-	st = f.waitFor(t, "恢复在线", func(s Status) bool { return s.State == StateOnline && s.OutageCount == 1 })
+	st := f.waitFor(t, "恢复在线", func(s Status) bool { return s.State == StateOnline && s.OutageCount == 1 })
 	if st.OutageSince != (time.Time{}) {
 		t.Fatalf("恢复后断网起点应清零：%+v", st.OutageSince)
 	}
