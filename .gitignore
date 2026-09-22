@@ -9,3 +9,13 @@ logs/
 
 # 跑 tools/ 里的 Python 脚本时产生的字节码缓存
 __pycache__/
+
+# 打包产物：build/ 只放二进制，源码与脚本照常入库
+# （tray/rsrc.syso 是编译需要的资源文件，要入库，别跟着 exe 一起忽略）
+build/*.exe
+build/GXU_Net_AutoLogin
+
+# 本机开发用的东西不入库：.zcode 是 Agent 工具的工作目录，tools/ 是本机脚本
+.zcode/
+.zcodeignore
+/tools/
