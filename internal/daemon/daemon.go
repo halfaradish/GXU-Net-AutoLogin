@@ -24,6 +24,14 @@ type Timing struct {
 	QuietAfter         time.Duration
 	QuietProbeInterval time.Duration
 	QuietLoginInterval time.Duration
+
+	// ChangeDebounce 是"网络变了"信号的去抖窗口：距上次认定的变化不足这么久，
+	// 新来的变化只当噪声（抖动链路会在失败类别之间来回跳，不去抖就等于一秒一发登录请求）
+	ChangeDebounce time.Duration
+
+	// Backoff 是登录失败的退避表；nil 表示用 netauth.Backoff。做成可注入是为了
+	// 测试能压到毫秒级——真实表是秒级，要观察到档位变化得等十几秒
+	Backoff []time.Duration
 }
 
 // DefaultTiming 返回与命令行版完全一致的节奏
@@ -37,6 +45,8 @@ func DefaultTiming() Timing {
 		QuietAfter:         20 * time.Minute,
 		QuietProbeInterval: 60 * time.Second,
 		QuietLoginInterval: 5 * time.Minute,
+		ChangeDebounce:     10 * time.Second,
+		Backoff:            netauth.Backoff,
 	}
 }
 
@@ -65,6 +75,12 @@ func (t Timing) withDefaults() Timing {
 	}
 	if t.QuietLoginInterval <= 0 {
 		t.QuietLoginInterval = d.QuietLoginInterval
+	}
+	if t.ChangeDebounce <= 0 {
+		t.ChangeDebounce = d.ChangeDebounce
+	}
+	if len(t.Backoff) == 0 {
+		t.Backoff = d.Backoff
 	}
 	return t
 }
@@ -359,6 +375,8 @@ func (d *Daemon) run(ctx context.Context, done chan<- struct{}, cfg *config.Conf
 		// "立即重连"：不管当前判定如何，直接认证一次
 		if d.takeForced() {
 			d.log.Info("手动触发：立即认证一次")
+			// 人工说试就试：这次失败不该让档位接着往上爬
+			st.backoffIdx = -1
 			d.attemptLogin(cfg, st, t, false)
 		}
 
@@ -377,8 +395,15 @@ func (d *Daemon) run(ctx context.Context, done chan<- struct{}, cfg *config.Conf
 			// 原先只报"判定断网"，看不出是超时、DNS 还是探测端点返回了异常状态码
 			st.outageSince = time.Now()
 			st.stat.Reset()
+			st.lastKind = fail.Kind
 			d.mutate(func(s *Status) { s.OutageCount++ })
 			d.log.Warn("探测失败（%s），连续 %d 次失败即判定断网", fail.Detail, t.FailThreshold)
+		} else if fail.Kind != st.lastKind {
+			// 失败类别变了 = 链路状态本身变了（比如从"完全不通"变成"拿到了门户的
+			// HTTP 响应"），详见 onNetworkChange
+			prev := st.lastKind
+			st.lastKind = fail.Kind
+			d.onNetworkChange(st, t, prev, fail.Kind)
 		}
 		st.stat.Add(fail)
 		d.noteFail(st, fail)
@@ -452,6 +477,14 @@ type loopState struct {
 	outageSince    time.Time
 	stat           netauth.OutageStat
 
+	// 断网期间"网络本身变了没有"：探测失败类别跟上一轮不一样就说明变了，
+	// 见 onNetworkChange。lastChange 是去抖基准，避免抖动链路触发一串重试。
+	lastKind   netauth.FailKind
+	lastChange time.Time
+
+	// 登录前的身份重解析发现 IP/MAC 变了（换网 / DHCP 续租），由 attemptLogin 消费
+	idChanged bool
+
 	// 认证身份（本机 IP/MAC）。零值表示还没解析出来——开机自启时网络可能还没就绪，
 	// 解析不出来就每轮重试，网络恢复后自然接上；解析出来后登录前还会再刷新一次，
 	// 因为换网 / DHCP 续租之后旧 IP 可能已经不对了。
@@ -466,7 +499,34 @@ func (st *loopState) reset() {
 	st.fails, st.fast, st.backoffIdx = 0, false, -1
 	st.downLogged, st.quietLogged, st.sessionAssumed = false, false, false
 	st.nextLogin, st.outageSince = time.Time{}, time.Time{}
+	st.lastKind, st.lastChange, st.idChanged = netauth.FailNone, time.Time{}, false
 	st.stat.Reset()
+}
+
+// acceptChange 是"网络变了"信号的去抖：距上次认定的变化太近就只当噪声。
+// 抖动链路会在失败类别之间来回跳，不去抖就等于跟着跳的节奏发登录请求。
+func (st *loopState) acceptChange(debounce time.Duration) bool {
+	now := time.Now()
+	if !st.lastChange.IsZero() && now.Sub(st.lastChange) < debounce {
+		return false
+	}
+	st.lastChange = now
+	return true
+}
+
+// onNetworkChange 处理断网期间的"网络变了"：探测失败类别跟上一轮不一样，说明链路
+// 状态本身变了（典型的是从"完全不通"变成"拿到了门户的 HTTP 响应"），前面那串失败
+// 推出来的档位不再作数。
+//
+// 做法是清零退避并当场再试一次——恢复不必再等满一个退避档（原先网络在第 90 秒恢复，
+// 最坏要等到第 162 秒才重试）。变化来得太密时按噪声丢掉，免得跟着抖动发请求。
+func (d *Daemon) onNetworkChange(st *loopState, t Timing, prev, now netauth.FailKind) {
+	if !st.acceptChange(t.ChangeDebounce) {
+		return
+	}
+	st.backoffIdx = -1
+	st.nextLogin = time.Time{} // 下一轮循环立刻允许登录（最多晚一次探测）
+	d.log.Info("网络状态变化（%s → %s），登录退避重置并立即重试", prev, now)
 }
 
 // resolveIdentity 解析一次认证身份并记下来
@@ -476,13 +536,18 @@ func (d *Daemon) resolveIdentity(cfg *config.Config, st *loopState) (netauth.Ide
 		return netauth.Identity{}, err
 	}
 
-	changed := id != st.id
+	prev := st.id
 	st.id = id
 	st.resolveWarned, st.skipWarned = false, false
 
 	d.mutate(func(s *Status) { s.Identity = id })
-	if changed {
+	switch {
+	case prev == (netauth.Identity{}):
 		d.log.Info("认证身份：IP=%s | MAC=%s（%s）", id.IP, id.MAC, id.Source)
+	case id != prev:
+		// 换网 / DHCP 续租：拿旧 IP 得出的失败结论不再作数，由 attemptLogin 清零退避
+		st.idChanged = true
+		d.log.Info("认证身份变化：%s → %s（%s），登录退避重置", prev.IP, id.IP, id.Source)
 	}
 	return id, nil
 }
@@ -573,6 +638,12 @@ func (d *Daemon) attemptLogin(cfg *config.Config, st *loopState, t Timing, quiet
 		return netauth.Outcome{Err: err}
 	}
 
+	// 身份变了（换网 / DHCP 续租）：上一次失败是拿旧 IP 换来的，档位不该继续往上爬
+	if st.idChanged {
+		st.idChanged = false
+		st.backoffIdx = -1
+	}
+
 	// 认证期间状态标成"认证中"，结束后还原——连接状态由探测决定，
 	// 一次登录的成败不该改写它（门户说成功、而探测仍失败的情况确实存在）
 	prev := d.Status().State
@@ -608,8 +679,8 @@ func (d *Daemon) attemptLogin(cfg *config.Config, st *loopState, t Timing, quiet
 		st.sessionAssumed, st.fast = true, false
 		st.nextLogin = time.Now().Add(t.SessionRecheck)
 	default:
-		st.backoffIdx = netauth.NextBackoffIndex(st.backoffIdx)
-		delay := netauth.Jitter(netauth.Backoff[st.backoffIdx])
+		st.backoffIdx = netauth.NextBackoffIndex(t.Backoff, st.backoffIdx)
+		delay := netauth.Jitter(t.Backoff[st.backoffIdx])
 		st.nextLogin = time.Now().Add(delay)
 		d.log.Warn("%s，%s 后重试", o.Desc(), delay.Round(time.Second))
 	}

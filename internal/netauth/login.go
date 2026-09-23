@@ -12,13 +12,25 @@ import (
 	"time"
 )
 
-// Backoff 是登录失败后的重试退避序列（附加 ±20% 抖动）
+// Backoff 是登录失败后的重试退避序列（附加 ±20% 抖动）。
+//
+// 爬升刻意放缓：比值约 1.5、10 档、约 2 分钟到顶。原先的 1/2/5/10/30/60 只要 48 秒
+// 就顶到最大档，于是判定断网一分钟后所有重试都被锁在 60 秒上——网络在 90 秒时恢复
+// 也得再等满一档（含抖动约 72 秒）。
+//
+// 档位不是"失败了几次"的记账：守护进程在网络一有变化时（探测失败类别变了、认证
+// IP/MAC 变了、手动触发）就把档位清零，见 daemon.onNetworkChange。所以真正决定
+// 间隔的是"距上次网络变化过了多久"。
 var Backoff = []time.Duration{
 	1 * time.Second,
 	2 * time.Second,
+	3 * time.Second,
 	5 * time.Second,
-	10 * time.Second,
-	30 * time.Second,
+	8 * time.Second,
+	12 * time.Second,
+	18 * time.Second,
+	27 * time.Second,
+	40 * time.Second,
 	60 * time.Second,
 }
 
@@ -127,10 +139,12 @@ func Login(user, password, netType, ip, mac string) Outcome {
 	}
 }
 
-// NextBackoffIndex 返回退避序列的下一档下标（-1 表示尚未退避过）
-func NextBackoffIndex(cur int) int {
-	if cur+1 >= len(Backoff) {
-		return len(Backoff) - 1
+// NextBackoffIndex 返回退避序列的下一档下标（cur = -1 表示尚未退避过），
+// 到末档就停在末档。sched 由调用方给：守护进程用 Timing.Backoff（可注入），
+// 默认就是上面这张表。
+func NextBackoffIndex(sched []time.Duration, cur int) int {
+	if cur+1 >= len(sched) {
+		return len(sched) - 1
 	}
 	return cur + 1
 }

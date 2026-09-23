@@ -28,6 +28,14 @@ func (p *toggleProber) set(ok bool, detail string) {
 	p.mu.Unlock()
 }
 
+// setFail 让探测按指定类别失败。类别决定守护怎么看待"网络变了"
+// （拿到 HTTP 响应还是完全不通，见 onNetworkChange）
+func (p *toggleProber) setFail(kind netauth.FailKind, detail string) {
+	p.mu.Lock()
+	p.ok, p.kind, p.why = false, kind, detail
+	p.mu.Unlock()
+}
+
 func (p *toggleProber) probe() (bool, netauth.ProbeFailure) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -138,7 +146,26 @@ func fastTiming() Timing {
 		QuietAfter:         25 * time.Millisecond,
 		QuietProbeInterval: 5 * time.Millisecond,
 		QuietLoginInterval: 15 * time.Millisecond,
+		ChangeDebounce:     2 * time.Millisecond,
+		// 真实退避表是秒级，测试里按同样的比值压到毫秒
+		Backoff: []time.Duration{
+			time.Millisecond, 2 * time.Millisecond, 3 * time.Millisecond,
+			5 * time.Millisecond, 8 * time.Millisecond, 12 * time.Millisecond,
+		},
 	}
+}
+
+// backoffTiming 是观察退避档位用的节奏：末档给 500ms，这样"退避清零后立刻重试"
+// （几毫秒）和"还排在末档上"（500ms）能明确区分。QuietAfter 必须拉远——静默分支
+// 是绕过退避的（每 QuietLoginInterval 一次），进了静默就测不到档位了。
+func backoffTiming() Timing {
+	t := fastTiming()
+	t.Backoff = []time.Duration{
+		2 * time.Millisecond, 5 * time.Millisecond, 20 * time.Millisecond, 500 * time.Millisecond,
+	}
+	t.ChangeDebounce = 10 * time.Millisecond
+	t.QuietAfter = 10 * time.Second
+	return t
 }
 
 // fixture 是搭好的一套 daemon + 测试替身
@@ -152,6 +179,12 @@ type fixture struct {
 
 func newFixture(t *testing.T, cfg *config.Config, mutate func(*fakeAuth)) *fixture {
 	t.Helper()
+	return newFixtureWithTiming(t, cfg, fastTiming(), mutate)
+}
+
+// newFixtureWithTiming 用指定节奏搭一套 fixture：退避相关的用例自带一张压缩的退避表
+func newFixtureWithTiming(t *testing.T, cfg *config.Config, timing Timing, mutate func(*fakeAuth)) *fixture {
+	t.Helper()
 
 	f := &fixture{
 		prober:   &toggleProber{},
@@ -164,7 +197,7 @@ func newFixture(t *testing.T, cfg *config.Config, mutate func(*fakeAuth)) *fixtu
 	}
 
 	f.d = New(f.log, cfg,
-		WithTiming(fastTiming()),
+		WithTiming(timing),
 		WithProber(f.prober.probe),
 		WithAuthenticator(f.auth.login),
 		// 身份解析固定住，测试不依赖真实网卡
@@ -204,6 +237,19 @@ func (f *fixture) waitCalls(t *testing.T, n int) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+}
+
+// waitCallsWithin 只给一段有限的窗口等新的登录调用。窗口故意取得比退避末档小，
+// 用它区分"退避清零后立刻重试"和"还排在末档上"
+func (f *fixture) waitCallsWithin(n int, within time.Duration) bool {
+	deadline := time.Now().Add(within)
+	for f.auth.count() < n {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return true
 }
 
 // logCount 数一段文字在日志里出现了几次
@@ -484,4 +530,115 @@ func TestStopIsIdempotent(t *testing.T) {
 	if st := f.d.Status(); st.State != StateStopped {
 		t.Fatalf("停止后状态应为已停止，实际 %+v", st)
 	}
+}
+
+// ── 退避：网络一变就该立刻重试，而不是接着往上爬 ──────────────
+
+// alwaysFailAuth 让每次登录都失败（走退避分支）
+func alwaysFailAuth(a *fakeAuth) {
+	a.next = func(int) netauth.Outcome {
+		return netauth.Outcome{Status: 200, Msg: "认证未成功"}
+	}
+}
+
+// 断网期间探测失败类别变了，说明链路状态本身变了（典型：从"完全不通"变成
+// "拿到了门户的 HTTP 响应"，即链路已通、只差认证）。这时必须当场再试一次——
+// 原来只能干等当前退避档，网络在第 90 秒恢复要拖到第 162 秒才重试。
+func TestProbeKindChangeResetsBackoffAndRetriesNow(t *testing.T) {
+	f := newFixtureWithTiming(t, testConfig(), backoffTiming(), alwaysFailAuth)
+	f.prober.setFail(netauth.FailTimeout, "超时：2s 内无响应")
+
+	if err := f.d.Start(); err != nil {
+		t.Fatalf("Start 失败：%v", err)
+	}
+
+	// 让档位爬到末档：4 次失败后的等待分别是 2/5/20/500ms
+	f.waitCalls(t, 4)
+	before := f.auth.count()
+
+	f.prober.setFail(netauth.FailStatus, "非 204 响应：HTTP 200")
+	// 窗口 150ms 故意小于末档 500ms：没清零退避的话这段时间里不会有新尝试
+	if !f.waitCallsWithin(before+1, 150*time.Millisecond) {
+		t.Fatalf("类别变化后 150ms 内没有重试（实际 %d 次调用），退避没被清零",
+			f.auth.count())
+	}
+	if !f.logContains("网络状态变化") {
+		t.Fatalf("日志里没有记下网络变化，只有：%v", logMessages(f))
+	}
+}
+
+// 换网 / DHCP 续租换了 IP：拿旧 IP 换来的失败结论作废，档位应清零重来
+func TestIdentityChangeResetsBackoff(t *testing.T) {
+	f := newFixtureWithTiming(t, testConfig(), backoffTiming(), alwaysFailAuth)
+	f.prober.setFail(netauth.FailTimeout, "超时：2s 内无响应")
+
+	if err := f.d.Start(); err != nil {
+		t.Fatalf("Start 失败：%v", err)
+	}
+	f.waitCalls(t, 4) // 档位爬到末档
+
+	f.resolver.ok("10.0.0.9", "aa:bb:cc:dd:ee:ff") // 换网了
+
+	// 下一次尝试会带着新 IP 出去，它的失败应当把档位清零：此后重试重新从最短档
+	// 开始（2ms、5ms、20ms…），200ms 里必然出现新尝试；没清零则要等满末档 500ms
+	f.waitCalls(t, 5)
+	before := f.auth.count()
+	time.Sleep(200 * time.Millisecond)
+	if got := f.auth.count(); got <= before {
+		t.Fatalf("身份变化后 200ms 内没有新的重试（仍是 %d 次），退避没被清零", got)
+	}
+	if !f.logContains("认证身份变化") {
+		t.Fatalf("日志里没有记下身份变化，只有：%v", logMessages(f))
+	}
+	if last := f.auth.snapshot()[f.auth.count()-1]; last.ip != "10.0.0.9" {
+		t.Fatalf("重试应当用新 IP，实际 %+v", last)
+	}
+}
+
+// 手动"立即重连"之后失败：档位不该接着往上爬，否则用户点一次反而把自己的
+// 下一次重试推远一档
+func TestManualTriggerResetsBackoff(t *testing.T) {
+	f := newFixtureWithTiming(t, testConfig(), backoffTiming(), alwaysFailAuth)
+	f.prober.setFail(netauth.FailTimeout, "超时：2s 内无响应")
+
+	if err := f.d.Start(); err != nil {
+		t.Fatalf("Start 失败：%v", err)
+	}
+	f.waitCalls(t, 4) // 档位爬到末档
+
+	f.d.Trigger()
+	f.waitCalls(t, 5) // 手动触发的那一次
+	before := f.auth.count()
+	time.Sleep(200 * time.Millisecond)
+	if got := f.auth.count(); got <= before {
+		t.Fatalf("手动触发后 200ms 内没有新的重试（仍是 %d 次），退避没被清零", got)
+	}
+}
+
+// 抖动链路会在失败类别之间来回跳：去抖窗口内重复到来的变化只当噪声，
+// 否则等于跟着抖动一秒一发登录请求
+func TestChangeDebounceIgnoresRapidSignals(t *testing.T) {
+	st := &loopState{}
+
+	if !st.acceptChange(10 * time.Second) {
+		t.Fatal("第一次变化不该被丢掉")
+	}
+	if st.acceptChange(10 * time.Second) {
+		t.Fatal("紧跟着的第二次变化应当按噪声丢掉")
+	}
+
+	st.lastChange = time.Now().Add(-11 * time.Second)
+	if !st.acceptChange(10 * time.Second) {
+		t.Fatal("过了去抖窗口的变化应当被接受")
+	}
+}
+
+// logMessages 把日志正文取出来，断言失败时打印出来便于定位
+func logMessages(f *fixture) []string {
+	lines, _ := f.log.Snapshot()
+	out := make([]string, 0, len(lines))
+	for _, l := range lines {
+		out = append(out, l.Message)
+	}
+	return out
 }
